@@ -19,6 +19,11 @@ class Monitor:
         self.columns = None
         self.baseline = None
         self.baseline_rows = None
+        self.command_offset = None
+        self.command_since = int(time.time())
+        self.bot_username = None
+        self.commands_enabled = bool(telegram)
+        self.next_poll = 0
 
     def setup(self, image):
         x1,y1,x2,y2 = self.config['query_rect']
@@ -64,7 +69,7 @@ class Monitor:
             return
         changes = compare(self.baseline_rows,rows) if self.baseline_rows is not None and rows is not None else []
         text = '\n'.join(f'[{c.level}] {c.message}' for c in changes) or '[변경] 화면 내용 변경 — 캡처 확인'
-        caption = '수술방 알림 | 현재 선택한 목록\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+text
+        caption = 'Alert Bot | 현재 선택한 목록\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+text
         if self.telegram:
             while not self.stop.is_set():
                 try:
@@ -78,12 +83,72 @@ class Monitor:
         self.baseline,self.baseline_rows = key,rows
         self.emit('change',(caption,second))
 
+    def send_current(self, image, reason):
+        caption = 'Alert Bot | '+reason+'\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if self.telegram:
+            while not self.stop.is_set():
+                try:
+                    self.telegram.send_capture(image,caption)
+                    break
+                except DeliveryError as error:
+                    if not error.retryable: raise
+                    self.emit('status',f'[{error.code}] {error} 캡처 전송 재시도 중')
+                    self.stop.wait(max(30,error.retry_after))
+            if self.stop.is_set(): return
+        self.emit('change',(caption,image))
+
+    def accepts_command(self, update):
+        message = update.get('message',{})
+        if str(message.get('chat',{}).get('id')) != self.telegram.chat_id:
+            return False
+        if message.get('date',0) < self.command_since or message.get('from',{}).get('is_bot'):
+            return False
+        text = message.get('text','').strip().split()
+        if not text: return False
+        command = text[0].lower()
+        return command == '/capture' or command == '/capture@'+self.bot_username.lower()
+
+    def poll_commands(self):
+        if not self.commands_enabled or time.monotonic() < self.next_poll: return
+        self.next_poll = time.monotonic()+2
+        try:
+            if self.bot_username is None:
+                self.bot_username = self.telegram.identity()['username']
+            updates = self.telegram.updates(self.command_offset)
+            requested = False
+            for update in updates:
+                if self.command_offset is not None and update['update_id'] < self.command_offset: continue
+                self.command_offset = update['update_id']+1
+                requested = self.accepts_command(update) or requested
+            if requested:
+                # No refresh or baseline change: send the current EMR client only.
+                self.send_current(self.desktop.capture(),'수동 캡처 /capture')
+        except DeliveryError as error:
+            if error.retryable:
+                self.next_poll = time.monotonic()+max(30,error.retry_after)
+            else:
+                self.commands_enabled = False
+            self.emit('status',f'명령 수신 오류 [{error.code}]: {error} 자동 감시는 계속됩니다.')
+
+    def wait_interval(self, seconds):
+        deadline = time.monotonic()+seconds
+        while not self.stop.is_set():
+            self.poll_commands()
+            remaining = deadline-time.monotonic()
+            if remaining <= 0: return False
+            if self.stop.wait(min(2,remaining)): return True
+        return True
+
     def run(self):
         try:
             if self.stop.wait(2): return
             self.desktop.activate()
             if self.stop.wait(.5): return
-            self.setup(self.desktop.capture())
+            initial = self.desktop.capture()
+            self.setup(initial)
+            self.send_current(initial,'감시 시작 · 현재 화면')
+            if self.stop.is_set(): return
+            self.emit('status','사용 중 · 자동 조회와 /capture 명령 대기')
             while not self.stop.is_set():
                 if idle_seconds() < 3:
                     if self.stop.wait(1): break
@@ -96,7 +161,7 @@ class Monitor:
                 if self.stop.wait(2): break
                 second = self.desktop.capture()
                 self.process(first,second)
-                if self.stop.wait(max(0,self.config['interval']-(time.monotonic()-started))): break
+                if self.wait_interval(max(0,self.config['interval']-(time.monotonic()-started))): break
         except (ValueError,GuardError,DeliveryError) as error:
             self.emit('error',str(error))
         except Exception as error:

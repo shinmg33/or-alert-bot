@@ -59,7 +59,7 @@ class Picker(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f'수술방 알림봇 {__version__}')
+        self.title(f'Alert Bot {__version__} · 중지됨')
         self.geometry('860x740')
         self.minsize(800, 700)
         self.option_add('*Font', ('맑은 고딕', 10))
@@ -87,20 +87,23 @@ class App(tk.Tk):
         self.token = tk.StringVar(value=self.config.get('token', ''))
         self.chat = tk.StringVar(value=self.config.get('chat_id', ''))
         self.interval = tk.StringVar(value=str(self.config.get('interval', 60)))
-        self.preview = tk.BooleanVar(value=True)
+        self.preview = tk.BooleanVar(value=self.config.get('preview', False))
         self.silent = tk.BooleanVar(value=self.config.get('silent_details', False))
         self.status = tk.StringVar(value='중지됨 · EMR에서 조건을 선택하고 조회 버튼 위치를 지정하세요.')
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.build()
         self.refresh_windows()
         self.after(150, self.poll)
+        self.bind('<Map>', self.on_restore)
+        if self.config.get('query_rect') and self.config.get('token') and self.config.get('chat_id') and len(self.windows) == 1:
+            self.after(700, self.start)
         if load_error:
             self.after(200, lambda: messagebox.showwarning('설정 읽기', load_error))
 
     def build(self):
         title = ttk.Frame(self, padding=18)
         title.pack(fill='x')
-        ttk.Label(title, text='수술방 알림봇', font=('맑은 고딕', 22, 'bold')).pack(anchor='w')
+        ttk.Label(title, text='Alert Bot', font=('맑은 고딕', 22, 'bold')).pack(anchor='w')
         ttk.Label(title, text='EMR에서 진료과·진료의를 직접 선택하세요. 봇은 조회 버튼만 누릅니다.').pack(anchor='w', pady=(4, 0))
         book = ttk.Notebook(self)
         book.pack(fill='both', expand=True, padx=18)
@@ -135,7 +138,7 @@ class App(tk.Tk):
             button.pack(side='left', padx=(0, 6))
             self.network_buttons.append(button)
         ttk.Label(connection, text='① 토큰 입력 → 연결 진단\n② 비공개 그룹에 봇 추가\n③ 그룹에서 /start@봇사용자이름 전송 → 그룹 찾기\n④ 그룹 선택 → 테스트 메시지 보내기', justify='left').pack(anchor='w', pady=8)
-        ttk.Label(connection, text='연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
+        ttk.Label(connection, text='감시 중 그룹에서 /capture 또는 /capture@봇사용자이름으로 현재 화면을 요청하세요.\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
 
         bottom = ttk.Frame(self, padding=18)
         bottom.pack(fill='x')
@@ -198,7 +201,7 @@ class App(tk.Tk):
     def collect(self):
         config = dict(self.config)
         config.update(token=self.token.get().strip(), chat_id=self.chat.get().strip(),
-                      interval=validate_interval(self.interval.get()), silent_details=self.silent.get())
+                      interval=validate_interval(self.interval.get()), silent_details=self.silent.get(), preview=self.preview.get())
         config.pop('departments', None)
         config.pop('control_overrides', None)
         return config
@@ -261,13 +264,23 @@ class App(tk.Tk):
             client = None if self.preview.get() else Telegram(config['token'], config['chat_id'])
             self.stop_event.clear()
             monitor = Monitor(window, config, self.stop_event, lambda kind, data: self.events.put((kind, data)), client)
+            self.config = config
+            save_settings(config)
             self.worker = threading.Thread(target=monitor.run, daemon=True)
             self.worker.start()
             self.start_button.configure(state='disabled')
             self.save_button.configure(state='disabled')
-            self.withdraw()
+            self.title('Alert Bot · 사용 중' + (' · 시험 모드' if self.preview.get() else ' · Telegram 연결'))
+            self.status.set('사용 중 · 첫 캡처 전송 및 조회 준비')
+            self.iconify()
         except ValueError as error:
             messagebox.showerror('감시 시작', str(error))
+
+    def on_restore(self, event):
+        if event.widget is self and self.active() and self.state() == 'normal':
+            self.stop_event.set()
+            self.status.set('설정 창을 열어 감시 중지 중입니다. 다시 시작하려면 감시 시작을 누르세요.')
+            self.title('Alert Bot · 중지 중')
 
     def stop(self):
         self.stop_event.set()
@@ -297,6 +310,7 @@ class App(tk.Tk):
                 caption, self.latest = data
                 self.status.set(caption.replace('\n', ' | '))
             elif kind == 'stopped':
+                self.title(f'Alert Bot {__version__} · 중지됨')
                 self.start_button.configure(state='normal')
                 self.save_button.configure(state='normal')
                 self.deiconify()

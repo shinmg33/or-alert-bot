@@ -4,7 +4,7 @@ import sys
 
 
 class GuiTest(unittest.TestCase):
-    def test_first_launch_is_stopped_and_local_only(self):
+    def test_first_launch_is_stopped_and_ready_to_send(self):
         # Isolate Tcl's thread-affine teardown from subsequent worker-thread OCR.
         code = r'''
 from unittest.mock import patch
@@ -13,7 +13,7 @@ with patch('or_alert.app.list_windows', return_value=[]), patch('or_alert.app.lo
     app = App()
     app.withdraw()
     app.update_idletasks()
-    assert app.preview.get()
+    assert not app.preview.get()
     assert not hasattr(app, 'checked')
     assert not hasattr(app, 'pick_column')
     assert not app.active()

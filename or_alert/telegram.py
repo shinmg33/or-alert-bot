@@ -116,7 +116,7 @@ class Telegram:
             raise ValueError('먼저 수신 그룹을 선택하세요.')
         # No patient information is used by this explicitly invoked test.
         return self._call('sendMessage', urllib.parse.urlencode({
-            'chat_id': self.chat_id, 'text': '수술방 알림봇 연결 테스트 — 환자정보 없는 테스트 메시지입니다.',
+            'chat_id': self.chat_id, 'text': 'Alert Bot 연결 테스트 — 환자정보 없는 테스트 메시지입니다.',
             'protect_content': 'true'}).encode(), 'application/x-www-form-urlencoded')
 
     def groups(self):
@@ -132,6 +132,12 @@ class Telegram:
                 if chat.get('type') in ('group', 'supergroup'):
                     found[str(chat['id'])] = chat.get('title', '그룹')
         return found
+
+    def updates(self, offset=None):
+        fields = {'timeout': 0, 'allowed_updates': json.dumps(['message'])}
+        if offset is not None:
+            fields['offset'] = offset
+        return self._call('getUpdates', urllib.parse.urlencode(fields).encode(), 'application/x-www-form-urlencoded')
 
     def send_capture(self, image, caption, silent=False):
         if self.chat_id is None:

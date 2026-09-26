@@ -59,3 +59,44 @@ class QueryOnlyTest(unittest.TestCase):
         m.stop=Stop()
         with patch('or_alert.query_monitor.idle_seconds',return_value=5): m.run()
         self.assertEqual(m.desktop.actions,['query'])
+
+class CommandsTest(QueryOnlyTest):
+    def client(self):
+        class Client:
+            chat_id='-123'
+            def __init__(self): self.sent=[]; self.pending=[]; self.offsets=[]
+            def identity(self): return {'username':'OurBot'}
+            def updates(self,offset): self.offsets.append(offset); return self.pending
+            def send_capture(self,image,caption,**kw): self.sent.append((image,caption))
+        return Client()
+
+    def update(self,m,uid=1,chat=-123,text='/capture',date=None):
+        return {'update_id':uid,'message':{'chat':{'id':chat},'date':m.command_since if date is None else date,'text':text}}
+
+    def test_commands_restricted_to_configured_group_and_bot(self):
+        client=self.client(); m,_=self.monitor(client); m.bot_username='OurBot'
+        self.assertTrue(m.accepts_command(self.update(m)))
+        self.assertTrue(m.accepts_command(self.update(m,text='/capture@OurBot')))
+        for update in [self.update(m,chat=-999),self.update(m,text='/capture@OtherBot'),self.update(m,date=m.command_since-1),self.update(m,text='/captureevil')]:
+            self.assertFalse(m.accepts_command(update))
+
+    def test_manual_capture_is_fresh_and_preserves_baseline(self):
+        client=self.client(); m,_=self.monitor(client)
+        image=self.image('fresh')
+        class Desktop:
+            def capture(self): return image
+        m.desktop=Desktop(); m.baseline='unchanged'
+        client.pending=[self.update(m)]
+        m.poll_commands()
+        self.assertIs(client.sent[0][0],image)
+        self.assertEqual(m.baseline,'unchanged')
+        m.next_poll=0; m.poll_commands()
+        self.assertEqual(len(client.sent),1)
+        self.assertEqual(client.offsets,[None,2])
+
+    def test_initial_send_even_without_changes(self):
+        client=self.client(); m,events=self.monitor(client)
+        m.send_current(self.image('initial'),'감시 시작')
+        self.assertEqual(len(client.sent),1)
+        self.assertIn('Alert Bot',client.sent[0][1])
+        self.assertTrue(any(e[0]=='change' for e in events))
