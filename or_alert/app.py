@@ -13,7 +13,7 @@ from .outline import Outline
 
 
 class Picker(tk.Toplevel):
-    def __init__(self, parent, image, prompt, callback=None):
+    def __init__(self, parent, image, prompt, callback=None, on_close=None):
         super().__init__(parent)
         self.title(prompt)
         self.callback, self.original = callback, image
@@ -32,6 +32,8 @@ class Picker(tk.Toplevel):
             self.canvas.bind('<B1-Motion>', self.drag)
             self.canvas.bind('<ButtonRelease-1>', self.finish)
         self.bind('<Escape>', lambda _: self.destroy())
+        if on_close:
+            self.bind('<Destroy>', lambda event: on_close() if event.widget is self else None)
         self.grab_set()
 
     def begin(self, event):
@@ -174,7 +176,7 @@ class App(tk.Tk):
         return self.worker is not None and self.worker.is_alive()
 
     def refresh_windows(self):
-        if self.active():
+        if self.active() and self.monitor.state != 'paused':
             return
         self.windows = list_windows()
         self.window_choice['values'] = [w.title for w in self.windows]
@@ -188,7 +190,7 @@ class App(tk.Tk):
         return self.windows[idx]
 
     def capture_setup(self):
-        if self.active() or self.capture_busy:
+        if self.capture_busy:
             return
         try:
             window = self.chosen_window()
@@ -196,25 +198,38 @@ class App(tk.Tk):
             messagebox.showerror('화면 확인', str(error))
             return
         self.capture_busy = True
+        if self.active():
+            self.monitor.begin_calibration()
+        self.hide_outline()
         self.status.set('EMR 화면을 캡처합니다. 조회 버튼만 드래그해주세요.')
         self.withdraw()
         def take():
             try:
                 desktop = Desktop(window)
                 desktop.activate()
-                self.sample = desktop.capture()
+                self.sample = desktop.capture_preview()
                 self.deiconify()
                 def selected(box):
                     self.config['query_rect'] = box
                     self.config['query_size'] = list(self.sample.size)
-                    self.status.set('조회 버튼 지정 완료. 감시 시작을 누르세요.')
-                Picker(self, self.sample, '조회 버튼만 드래그하세요', selected)
+                    if self.active():
+                        self.monitor.end_calibration(window, box, self.sample.size)
+                    try:
+                        save_settings(self.config)
+                        self.status.set('조회 버튼 지정·저장 완료. 감시 재시작을 누르세요.')
+                    except Exception:
+                        self.status.set('조회 버튼은 적용됐지만 설정 저장에 실패했습니다.')
+                Picker(self, self.sample, '조회 버튼만 드래그하세요', selected, on_close=self.finish_calibration)
             except Exception as error:
                 self.deiconify()
                 self.status.set(str(error) if isinstance(error, GuardError) else 'EMR 화면 캡처 실패.')
-            finally:
-                self.capture_busy = False
+                self.finish_calibration()
         self.after(1500, take)
+
+    def finish_calibration(self):
+        self.capture_busy = False
+        if self.monitor:
+            self.monitor.end_calibration()
 
     def collect(self):
         self.preview.set(self.mode_choice.get() != 'Telegram 전송')
@@ -300,7 +315,7 @@ class App(tk.Tk):
             messagebox.showerror('감시 시작', str(error))
 
     def on_restore(self, event):
-        if event.widget is self and self.active() and self.state() == 'normal':
+        if event.widget is self and self.active() and not self.capture_busy and self.state() == 'normal':
             self.monitor.pause('사용자가 설정 창을 열었습니다.')
             self.status.set('설정 창을 열어 감시 대기 중입니다. 감시 재시작 또는 /restart로 재개하세요.')
             self.title('Alert Bot · 중지 중')

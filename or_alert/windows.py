@@ -168,6 +168,18 @@ class Desktop:
                         raise GuardError('조회 버튼 또는 수술 목록이 가려져 잠시 대기합니다.')
         return box
 
+    def capture_preview(self):
+        """Local manual picker only: the user reviews the image before selecting.
+
+        No occlusion gate: regions are precisely what the user is configuring.
+        This method never sends an image or clicks an EMR control.
+        """
+        hwnd = self.window.handle
+        if not u.IsWindow(hwnd) or u.IsIconic(hwnd) or title(hwnd) != self.window.title or executable(hwnd) != self.window.executable:
+            raise GuardError('선택한 EMR 창을 확인할 수 없습니다. 창 찾기를 다시 눌러주세요.')
+        box = client_box(hwnd)
+        return ImageGrab.grab(bbox=box, all_screens=True).convert('RGB')
+
     def capture(self):
         box = self.guard()
         image = ImageGrab.grab(bbox=box, all_screens=True).convert('RGB')

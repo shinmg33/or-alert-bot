@@ -45,6 +45,7 @@ class Monitor:
         self.desktop_lock = threading.RLock()
         self.watch_done = threading.Event()
         self.watch_thread = None
+        self.calibrating = False
         self.state = 'recovering'
         self.notices = queue.Queue()
         self.capture_requested = False
@@ -81,8 +82,31 @@ class Monitor:
                 self.automatic_pause_since = None
                 self.notices.put('감시 대기: '+reason+suffix)
 
+    def begin_calibration(self):
+        with self.desktop_lock:
+            self.calibrating = True
+            self.pause('조회 버튼 위치 지정 중')
+
+    def end_calibration(self, window=None, rectangle=None, size=None):
+        with self.desktop_lock:
+            if rectangle is not None:
+                self.config['query_rect'] = list(rectangle)
+                self.config['query_size'] = list(size)
+                self.desktop.window = window
+                self.desktop.size = list(size)
+                self.desktop.critical_regions = [list(rectangle)]
+                self.desktop.expected_input = None
+                self.region = self.columns = None
+                self.baseline = self.baseline_rows = None
+                self.initial_sent = False
+                self.capture_requested = False
+            self.calibrating = False
+
     def restart(self):
         with self.desktop_lock:
+            if self.calibrating:
+                self.notices.put('조회 위치 지정 중입니다. 완료 후 /restart를 요청하세요.')
+                return
             if self.stop.is_set(): return
             self.state = 'recovering'
             self.next_recovery = 0
