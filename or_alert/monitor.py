@@ -57,6 +57,7 @@ class Monitor:
         self.last_query = None
         self.cached_image = None
         self.cached_words = []
+        self.query_reference = None
 
     def crop(self, image, name):
         return image.crop(self.config['rects'][name])
@@ -90,7 +91,14 @@ class Monitor:
             self.date, self.filters = date, filters
         elif date != self.date or filters != self.filters:
             raise GuardError('수술일·수술상태·수술방 조건이 바뀌었습니다. 다시 시작해 기준을 설정하세요.')
-        if '조회' not in self.text(image, 'query'):
+        if 'query' in self.config.get('control_overrides', {}):
+            from .visual import digest, glyphs
+            signature = digest(glyphs(self.crop(image, 'query')))
+            if self.query_reference is None:
+                self.query_reference = signature
+            elif self.query_reference != signature:
+                raise GuardError('지정한 조회 버튼 화면이 바뀌었습니다. 감시를 중단했습니다.')
+        elif '조회' not in self.text(image, 'query'):
             raise GuardError('조회 버튼을 확인할 수 없습니다.')
 
     def select_department(self, dept):

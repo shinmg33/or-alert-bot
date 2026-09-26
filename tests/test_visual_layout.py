@@ -78,3 +78,25 @@ class AutoLayoutTest(unittest.TestCase):
         ImageDraw.Draw(image).rectangle((565,206,565,229),fill='white')
         with self.assertRaises(LayoutError):
             auto_layout(image,reader)
+    def test_missing_header_ocr_is_not_required(self):
+        image,reader=self.fixture()
+        original=reader.words(image)
+        reader.words=lambda _: [w for w in original if w.text != '환자상태']
+        reader.text=lambda _: ''
+        self.assertEqual(auto_layout(image,reader)['header_height'],24)
+
+    def test_manual_controls_work_without_any_ocr(self):
+        image,reader=self.fixture()
+        reader.words=lambda _: []
+        areas={'department':[487,97,654,116],'doctor':[771,97,867,116],'query':[1840,96,1895,117]}
+        result=auto_layout(image,reader,areas)
+        for name,area in areas.items(): self.assertEqual(result['rects'][name],area)
+        areas['query']=[500,210,540,240]
+        with self.assertRaises(LayoutError): auto_layout(image,reader,areas)
+
+    def test_wrong_column_widths_rejected(self):
+        image,reader=self.fixture()
+        draw=ImageDraw.Draw(image)
+        draw.line((565,207,565,228),fill=(205,235,245))
+        draw.line((580,206,580,229),fill=(146,188,202))
+        with self.assertRaises(LayoutError): auto_layout(image,reader)

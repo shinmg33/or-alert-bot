@@ -80,3 +80,8 @@ python run.py
 별도 Python 없이 실행 가능한 폴더형 EXE를 만듭니다. 한국어 OCR 언어팩은 별도이며 EXE는 서명되지 않았습니다.
 
 참고: [Telegram API](https://core.telegram.org/bots/api), [Windows OCR](https://learn.microsoft.com/en-us/uwp/api/windows.media.ocr.ocrengine), [XPLATFORM](https://docs.tobesoft.com/developer_guide_xplatform_en)
+
+### 0.2.1 화면 인식 수정
+- 환자상태 머리글 OCR 실패로 감시가 막히는 문제를 수정했습니다. 수술 표의 23개 열 격자와 너비 배치로 인식합니다.
+- 진료과·진료의·조회 수동 보정은 해당 버튼의 자동 글자 인식을 대체합니다. 열 위치 지정은 필요 없습니다.
+- 알 수 없는 표 배치는 입력 전에 중단합니다. 수동 조회 영역은 감시 중 화면 변화도 확인합니다.
