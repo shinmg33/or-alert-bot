@@ -2,6 +2,7 @@
 import asyncio
 from dataclasses import dataclass
 import re
+from PIL import ImageOps
 from .core import Row, Snapshot, compact
 
 
@@ -19,10 +20,11 @@ class Word:
 
 
 class Reader:
-    def __init__(self):
+    def __init__(self, clean=False):
         from winrt.windows.media.ocr import OcrEngine
         from winrt.windows.globalization import Language
         self.engine = OcrEngine.try_create_from_language(Language('ko-KR'))
+        self.clean = clean
         if self.engine is None:
             raise ValueError('Windows 한국어 OCR 언어팩이 필요합니다. 설정 → 언어에서 한국어 OCR을 설치하세요.')
 
@@ -31,8 +33,12 @@ class Reader:
         from winrt.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat, BitmapAlphaMode
         from winrt.windows.storage.streams import DataWriter
         # Scale small EMR fonts without exceeding the OS engine limit.
-        scale = min(2.0, OcrEngine.max_image_dimension / max(image.size))
-        scaled = image.resize((int(image.width * scale), int(image.height * scale)))
+        # Clear colored cell backgrounds and pad small labels for Windows OCR.
+        padding = 12 if self.clean else 0
+        prepared = (ImageOps.expand(ImageOps.grayscale(image).point(lambda value: 0 if value < 155 else 255),
+                                   border=padding, fill=255) if self.clean else image)
+        scale = min(3.0 if self.clean else 2.0, OcrEngine.max_image_dimension / max(prepared.size))
+        scaled = prepared.resize((int(prepared.width * scale), int(prepared.height * scale)))
         writer = DataWriter()
         bitmap = None
         try:
@@ -41,7 +47,7 @@ class Reader:
                 writer.detach_buffer(), BitmapPixelFormat.BGRA8,
                 scaled.width, scaled.height, BitmapAlphaMode.IGNORE)
             result = await self.engine.recognize_async(bitmap)
-            return [Word(word.text, word.bounding_rect.x / scale, word.bounding_rect.y / scale,
+            return [Word(word.text, word.bounding_rect.x / scale - padding, word.bounding_rect.y / scale - padding,
                          word.bounding_rect.width / scale, word.bounding_rect.height / scale)
                     for line in result.lines for word in line.words]
         finally:

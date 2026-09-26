@@ -23,6 +23,8 @@ u.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
 u.GetClientRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
 u.ClientToScreen.argtypes = [W.HWND, C.POINTER(W.POINT)]
 u.GetWindowRect.argtypes = [W.HWND, C.POINTER(W.RECT)]
+u.SetForegroundWindow.argtypes = [W.HWND]
+u.SetForegroundWindow.restype = W.BOOL
 u.GetAsyncKeyState.argtypes = [C.c_int]
 u.GetAsyncKeyState.restype = C.c_short
 u.WindowFromPoint.argtypes = [W.POINT]
@@ -118,6 +120,13 @@ class Desktop:
     def arm_user_input(self):
         self.expected_input = input_tick()
 
+    def activate(self):
+        if not u.IsWindow(self.window.handle) or title(self.window.handle) != self.window.title:
+            raise GuardError('EMR 목록 창이 바뀌었습니다. 다시 열어주세요.')
+        if u.IsIconic(self.window.handle):
+            raise GuardError('EMR 목록 창을 최소화 해제해주세요.')
+        u.SetForegroundWindow(self.window.handle)
+
     def guard(self):
         hwnd = self.window.handle
         if self.stopped() or stop_pressed():
@@ -170,10 +179,18 @@ class Desktop:
     def select(self, kind, rectangle, index):
         if kind not in ('department', 'doctor') or not 0 <= index <= 200:
             raise GuardError('선택 항목 또는 순번이 잘못되었습니다.')
+        self._select_keys(kind, rectangle, [0x24] + [0x28] * index + [0x0D])
+
+    def select_next(self, kind, rectangle):
+        if kind not in ('department', 'doctor'):
+            raise GuardError('허용되지 않은 선택 대상입니다.')
+        self._select_keys(kind, rectangle, [0x28, 0x0D])
+
+    def _select_keys(self, kind, rectangle, keys):
         self.click(kind, rectangle)
         time.sleep(0.2)
         # Only navigation within the selected combo; never type arbitrary text.
-        for vk in [0x24] + [0x28] * index + [0x0D]:
+        for vk in keys:
             if self.stopped() or stop_pressed() or u.GetForegroundWindow() != self.window.handle or self.expected_input != input_tick():
                 raise GuardError('선택 중 창이 바뀌었거나 중지되었습니다.')
             u.keybd_event(vk, 0, 0, 0)

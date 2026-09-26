@@ -70,7 +70,9 @@ def compare(before, after):
     for key in sorted(set(old) & set(new)):
         a, b = old[key][0], new[key][0]
         if a.status != b.status:
-            result.append(Change('주요', f'환자상태: {a.status} → {b.status}'))
+            message = ('환자상태 표시 변경 — 캡처 확인' if a.status.startswith('화면:') or b.status.startswith('화면:')
+                       else f'환자상태: {a.status} → {b.status}')
+            result.append(Change('주요', message))
         if a.details != b.details:
             da, db = dict(a.details), dict(b.details)
             fields = sorted(k for k in da.keys() | db.keys() if da.get(k) != db.get(k))

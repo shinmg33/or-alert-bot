@@ -3,6 +3,8 @@ import time
 from datetime import datetime
 from .core import Tracker, compact, validate_interval
 from .ocr import Reader, parse_table
+from .layout import auto_layout
+from .visual import visual_snapshot
 from .windows import Desktop, GuardError, idle_seconds
 
 RECT_NAMES = ('department', 'doctor', 'query', 'date', 'total', 'table', 'status_filter', 'room_filter')
@@ -15,8 +17,8 @@ def validate_config(config):
     if len({d['name'] for d in config['departments']}) != len(config['departments']):
         raise ValueError('진료과 이름이 중복됩니다.')
     for dept in config['departments']:
-        if not dept['name'] or not 0 <= dept['index'] <= 200:
-            raise ValueError('진료과 이름과 목록 순번(0~200)을 확인하세요.')
+        if not dept['name']:
+            raise ValueError('진료과 이름을 입력하세요.')
     width, height = config['size']
     for name in RECT_NAMES:
         box = config['rects'].get(name)
@@ -43,20 +45,29 @@ def validate_config(config):
 
 class Monitor:
     def __init__(self, window, config, stop, emit, telegram=None):
-        validate_config(config)
+        validate_interval(config['interval'])
+        if not config.get('departments'):
+            raise ValueError('감시할 진료과 이름을 입력하세요.')
         self.config, self.stop, self.emit, self.telegram = config, stop, emit, telegram
-        self.desktop = Desktop(window, config['size'], stop.is_set)
+        self.desktop = Desktop(window, stopped=stop.is_set)
         self.tracker = Tracker()
         self.reader = None
         self.date = None
         self.filters = None
         self.last_query = None
+        self.cached_image = None
+        self.cached_words = []
 
     def crop(self, image, name):
         return image.crop(self.config['rects'][name])
 
     def text(self, image, name):
-        return self.reader.text(self.crop(image, name))
+        if self.cached_image is not image:
+            self.cached_words = self.reader.words(image.crop((0, 0, image.width, self.config['rects']['table'][1])))
+            self.cached_image = image
+        left, top, right, bottom = self.config['rects'][name]
+        words = [w for w in self.cached_words if left <= w.x+w.width/2 <= right and top <= w.cy <= bottom]
+        return compact(''.join(w.text for w in sorted(words, key=lambda w:w.x)))
 
     def inspect(self, image, department):
         if self.text(image, 'department') != compact(department):
@@ -67,19 +78,14 @@ class Monitor:
         total = self.text(image, 'total')
         if not re.fullmatch(r'\d{1,3}', total):
             raise GuardError('총 건수 숫자를 인식할 수 없습니다. 숫자 영역만 지정하세요.')
-        words = self.reader.words(self.crop(image, 'table'))
-        header = compact(''.join(w.text for w in words if w.y < self.config['header_height']))
-        if not all(text in header for text in ('등록번호', '환자상태', '수술명')):
-            raise GuardError('수술 표의 머리글을 확인할 수 없습니다.')
-        return parse_table(words, self.config['columns'], self.config['header_height'],
-                           int(total), self.date, department)
+        return visual_snapshot(self.crop(image, 'table'), self.config['columns'], self.config['header_height'],
+                               int(total), self.date, department)
 
     def check_context(self, image):
-        date = self.text(image, 'date')
-        if not re.fullmatch(r'\d{4}[-./]\d{2}[-./]\d{2}', date):
-            raise GuardError('수술일을 인식할 수 없습니다. 날짜 글자만 지정하세요.')
+        # Keep the date as displayed; do not announce an OCR-guessed date.
+        date = '화면에서 선택한 날짜'
         # Pixel signatures retain radio-button selection, which OCR alone misses.
-        filters = tuple(self.crop(image, key).tobytes() for key in ('status_filter', 'room_filter'))
+        filters = tuple(self.crop(image, key).tobytes() for key in ('date', 'status_filter', 'room_filter'))
         if self.date is None:
             self.date, self.filters = date, filters
         elif date != self.date or filters != self.filters:
@@ -91,28 +97,46 @@ class Monitor:
         image = self.desktop.capture()
         self.check_context(image)
         if self.text(image, 'department') != compact(dept['name']):
-            self.desktop.select('department', self.config['rects']['department'], dept['index'])
-            if self.stop.wait(0.5):
-                return False
+            self.emit('status', f'{dept["name"]} 선택 중 — 진료과 목록을 이름으로 확인합니다.')
+            self.select_named('department', dept['name'])
             image = self.desktop.capture()
-            if self.text(image, 'department') != compact(dept['name']):
-                raise GuardError('진료과 선택 실패. 목록 순번을 확인하세요. 조회하지 않았습니다.')
         if self.text(image, 'doctor') != '전체':
-            self.desktop.select('doctor', self.config['rects']['doctor'], 0)
-            if self.stop.wait(0.5):
-                return False
+            self.select_named('doctor', '전체')
             image = self.desktop.capture()
-            if self.text(image, 'doctor') != '전체':
-                raise GuardError('진료의 전체 선택 실패. 조회하지 않았습니다.')
         self.check_context(image)
         return True
 
+    def select_named(self, kind, expected):
+        rect = self.config['rects'][kind]
+        self.desktop.select(kind, rect, 0)
+        previous = None
+        for _ in range(200):
+            if self.stop.wait(.25):
+                raise GuardError('사용자가 감시를 중지했습니다.')
+            image = self.desktop.capture()
+            current = self.text(image, kind)
+            if current == compact(expected):
+                return
+            if not current or current == previous:
+                break
+            previous = current
+            self.desktop.select_next(kind, rect)
+        raise GuardError(f'{expected} 항목을 확인하지 못했습니다. 이름과 목록을 확인하세요. 조회하지 않았습니다.')
+
     def run(self):
         try:
-            self.reader = Reader()
-            self.emit('status', '5초 뒤 시작합니다. EMR 목록을 맨 앞으로 두세요. F8로 중지할 수 있습니다.')
-            if self.stop.wait(5):
+            self.reader = Reader(clean=True)
+            self.emit('status', 'EMR 화면을 자동 확인합니다. F8로 중지할 수 있습니다.')
+            if self.stop.wait(2):
                 return
+            self.desktop.activate()
+            if self.stop.wait(.5):
+                return
+            image = self.desktop.capture()
+            self.config.update(auto_layout(image, self.reader, self.config.get('control_overrides')))
+            validate_config(self.config)
+            self.desktop.size = self.config['size']
+            self.emit('status', '진료과·진료의·조회와 수술 표를 자동 확인했습니다.')
             index = 0
             while not self.stop.is_set():
                 if idle_seconds() < 3:
@@ -140,7 +164,7 @@ class Monitor:
                 if changes:
                     text = '\n'.join(f'[{change.level}] {change.message}' for change in changes)
                     caption = f'수술방 알림 | {dept["name"]}\n수술일 {second.date} · 감지 {when}\n{text}'
-                    capture = self.crop(second_image, 'table')
+                    capture = second_image
                     if self.stop.is_set():
                         break
                     if self.telegram:
@@ -150,9 +174,12 @@ class Monitor:
                                 self.telegram.send_capture(capture, caption,
                                     silent=self.config.get('silent_details', False) and all(c.level == '세부' for c in changes))
                                 break
-                            except DeliveryError:
-                                self.emit('status', '전송 실패: 캡처를 메모리에 보관하고 30초 뒤 재시도합니다. 조회는 대기합니다. 중복 수신 가능성이 있습니다.')
-                                self.stop.wait(30)
+                            except DeliveryError as error:
+                                if not error.retryable:
+                                    raise
+                                delay = max(30, error.retry_after)
+                                self.emit('status', f'[{error.code}] {error} {delay}초 뒤 재시도합니다. 조회는 대기합니다.')
+                                self.stop.wait(delay)
                         if self.stop.is_set():
                             break
                     self.tracker.acknowledge(second)
