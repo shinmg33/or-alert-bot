@@ -148,7 +148,7 @@ class App(tk.Tk):
             button.pack(side='left', padx=(0, 6))
             self.network_buttons.append(button)
         ttk.Label(connection, text='① 토큰 입력 → 연결 진단\n② 비공개 그룹에 봇 추가\n③ 그룹에서 /start@봇사용자이름 전송 → 그룹 찾기\n④ 그룹 선택 → 테스트 메시지 보내기', justify='left').pack(anchor='w', pady=8)
-        ttk.Label(connection, text='감시 중 그룹에서 /capture 또는 /capture@봇사용자이름으로 현재 화면을 요청하세요.\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
+        ttk.Label(connection, text='그룹 명령: /capture 현재 화면 · /stop 감시 대기 · /restart 재시작\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
 
         bottom = ttk.Frame(self, padding=18)
         bottom.pack(fill='x')
@@ -266,7 +266,10 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def start(self):
-        if self.active() or self.capture_busy:
+        if self.capture_busy: return
+        if self.active():
+            self.monitor.restart()
+            self.iconify()
             return
         try:
             config = self.collect()
@@ -289,16 +292,16 @@ class App(tk.Tk):
 
     def on_restore(self, event):
         if event.widget is self and self.active() and self.state() == 'normal':
-            self.monitor.request_stop('사용자가 설정 창을 열어 감시를 중지했습니다.')
-            self.status.set('설정 창을 열어 감시 중지 중입니다. 다시 시작하려면 감시 시작을 누르세요.')
+            self.monitor.pause('사용자가 설정 창을 열었습니다.')
+            self.status.set('설정 창을 열어 감시 대기 중입니다. 감시 재시작 또는 /restart로 재개하세요.')
             self.title('Alert Bot · 중지 중')
 
     def stop(self):
         if self.monitor:
-            self.monitor.request_stop('사용자가 중지 버튼 또는 F8로 감시를 중지했습니다.')
+            self.monitor.pause('사용자가 중지 버튼 또는 F8을 눌렀습니다.')
         else:
             self.stop_event.set()
-        self.status.set('중지 요청됨 · 진행 중인 전송은 완료까지 최대 20초 걸릴 수 있습니다.')
+        self.status.set('감시 대기 요청됨 · Telegram 명령 수신은 유지합니다. 진행 중인 전송은 완료될 수 있습니다.')
         self.deiconify()
 
     def show_latest(self):
@@ -327,7 +330,19 @@ class App(tk.Tk):
                 self.hide_outline()
                 self.title('Alert Bot · 중단됨 · 알림 전송 중')
                 self.status.set(data)
+            elif kind == 'paused':
+                self.hide_outline()
+                self.title('Alert Bot · 감시 대기 · 명령 수신 중')
+                self.status.set(data)
+                self.start_button.configure(state='normal', text='감시 재시작')
+            elif kind == 'resuming':
+                self.hide_outline()
+                self.title('Alert Bot · 입력 종료 대기 중')
+                self.iconify()
             elif kind == 'watching':
+                self.hide_outline()
+                self.title('Alert Bot · 사용 중')
+                self.start_button.configure(state='disabled', text='감시 시작')
                 if not self.stop_event.is_set():
                     try:
                         self.outline = Outline(self, data)

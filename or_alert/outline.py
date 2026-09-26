@@ -2,7 +2,7 @@
 import ctypes as C
 from ctypes import wintypes as W
 import tkinter as tk
-from .windows import u, client_box
+from .windows import u, client_box, OUTLINE_HANDLES
 
 u.GetWindowLongW.argtypes=[W.HWND,C.c_int]
 u.SetWindowLongW.argtypes=[W.HWND,C.c_int,W.LONG]
@@ -39,6 +39,7 @@ class Outline:
                 self.close()
                 raise RuntimeError('이 Windows 환경에서는 캡처 제외 테두리를 표시할 수 없습니다.')
             self.parts.append((part,hwnd))
+            OUTLINE_HANDLES.add(hwnd)
         self.refresh()
 
     def refresh(self):
@@ -56,5 +57,7 @@ class Outline:
         if self.timer:
             self.parent.after_cancel(self.timer)
             self.timer=None
-        for part,_ in self.parts: part.destroy()
+        for part,hwnd in self.parts:
+            OUTLINE_HANDLES.discard(hwnd)
+            part.destroy()
         self.parts=[]

@@ -13,6 +13,7 @@ class QueryOnlyTest(unittest.TestCase):
         m=Monitor(Window(0,'fake','fake'),{'interval':30,'query_rect':[160,5,190,20],
                   'query_size':[200,140]},threading.Event(),lambda *e:events.append(e),telegram)
         m.setup(Image.new('RGB',(200,140),'white'))
+        m.state='running'
         return m,events
 
     def image(self,text):
@@ -43,23 +44,19 @@ class QueryOnlyTest(unittest.TestCase):
 
     def test_run_only_clicks_query(self):
         m,_=self.monitor()
+        m.state='recovering'
         class Desktop:
-            def __init__(self): self.actions=[]; self.window=Window(0,'fake','fake'); self.expected_input=None
+            expected_input=None
+            window=Window(0,'fake','fake')
+            def __init__(self): self.actions=[]
             def activate(self): pass
             def arm_user_input(self): pass
             def capture(self): return Image.new('RGB',(200,140),'white')
-            def click(self,kind,rect): self.actions.append(kind)
-        class Stop:
-            def __init__(self): self.calls=0
-            def set(self): pass
-            def is_set(self): return False
-            def wait(self,_):
-                self.calls+=1
-                return self.calls>=5
+            def click(self,kind,rect): self.actions.append(kind); m.stop.set()
         m.desktop=Desktop()
-        m.stop=Stop()
         with patch('or_alert.query_monitor.idle_seconds',return_value=5): m.run()
         self.assertEqual(m.desktop.actions,['query'])
+
 
 class CommandsTest(QueryOnlyTest):
     def client(self):
@@ -89,6 +86,8 @@ class CommandsTest(QueryOnlyTest):
         m.desktop=Desktop(); m.baseline='unchanged'
         client.pending=[self.update(m)]
         m.poll_commands()
+        self.assertTrue(m.capture_requested)
+        m.send_current(m.capture(),'수동 캡처 /capture')
         self.assertIs(client.sent[0][0],image)
         self.assertEqual(m.baseline,'unchanged')
         m.next_poll=0; m.poll_commands()

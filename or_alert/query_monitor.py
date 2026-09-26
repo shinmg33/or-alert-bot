@@ -2,6 +2,7 @@
 import time
 import threading
 import math
+import queue
 from datetime import datetime
 from .core import compare, validate_interval
 from .layout import detect_grid, LayoutError
@@ -44,6 +45,12 @@ class Monitor:
         self.desktop_lock = threading.RLock()
         self.watch_done = threading.Event()
         self.watch_thread = None
+        self.state = 'recovering'
+        self.notices = queue.Queue()
+        self.capture_requested = False
+        self.initial_sent = False
+        self.next_query = 0
+        self.next_recovery = 0
 
     def request_stop(self, reason):
         first = False
@@ -55,6 +62,25 @@ class Monitor:
         if first:
             self.emit('stopping', self.stop_reason)
 
+    def pause(self, reason, automatic=False):
+        with self.desktop_lock:
+            if self.stop.is_set(): return
+            target = 'recovering' if automatic else 'paused'
+            if self.state == 'paused' and automatic: return
+            if self.state == target: return
+            self.state = target
+            self.emit('paused', reason)
+            suffix = ' 입력이 5초 이상 없으면 자동 복구합니다.' if automatic else ' /restart로 재개할 수 있습니다.'
+            self.notices.put('감시 대기: '+reason+suffix)
+
+    def restart(self):
+        with self.desktop_lock:
+            if self.stop.is_set(): return
+            self.state = 'recovering'
+            self.next_recovery = 0
+            self.emit('resuming', None)
+            self.notices.put('재시작 요청 접수. 사용자 입력이 5초 이상 없으면 EMR을 복구합니다.')
+
     def check_lifecycle(self):
         if self.stop.is_set(): return
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -62,11 +88,43 @@ class Monitor:
             self.request_stop(f'예약한 {self.hours:g}시간이 지나 자동 종료했습니다.')
             return
         with self.desktop_lock:
-            if self.desktop.expected_input is not None:
+            if self.state == 'running' and self.desktop.expected_input is not None:
                 try:
                     self.desktop.guard()
                 except GuardError as error:
-                    self.request_stop(str(error))
+                    self.pause(str(error), automatic=error.recoverable)
+
+    def flush_notices(self):
+        while not self.notices.empty():
+            text = 'Alert Bot | '+self.notices.get()
+            self.emit('status',text)
+            if self.telegram:
+                try: self.telegram.send_notice(text)
+                except DeliveryError as error:
+                    self.emit('status',f'상태 알림 실패 [{error.code}]: {error}')
+
+    def recover(self):
+        if self.state != 'recovering' or idle_seconds() < 5 or time.monotonic() < self.next_recovery:
+            return False
+        self.next_recovery = time.monotonic()+5
+        with self.desktop_lock:
+            if self.state != 'recovering' or self.stop.is_set(): return False
+            self.desktop.activate()
+            self.desktop.arm_user_input()
+        if self.stop.wait(.5): return False
+        with self.desktop_lock:
+            if self.state != 'recovering': return False
+            image = self.desktop.capture()
+            self.setup(image)
+            self.state = 'running'
+            self.next_query = 0
+            self.emit('watching', self.desktop.window)
+        if not self.initial_sent:
+            self.send_current(image,'감시 시작 · 현재 화면')
+            self.initial_sent = True
+        else:
+            self.notices.put('EMR 화면 확인 완료. 감시를 재개했습니다.')
+        return True
 
     def watch(self):
         while not self.watch_done.wait(.25):
@@ -90,6 +148,7 @@ class Monitor:
                 self.emit('error','감시는 중단됐지만 중단 알림 전송에 실패했습니다.')
 
     def setup(self, image):
+        self.columns = None
         x1,y1,x2,y2 = self.config['query_rect']
         if tuple(image.size) != tuple(self.config['query_size']) or not (0 <= x1 < x2 <= image.width and 0 <= y1 < y2 <= image.height):
             raise ValueError('창 크기가 바뀌었습니다. 조회 버튼 위치를 다시 지정해주세요.')
@@ -135,42 +194,46 @@ class Monitor:
         text = '\n'.join(f'[{c.level}] {c.message}' for c in changes) or '[변경] 화면 내용 변경 — 캡처 확인'
         caption = 'Alert Bot | 현재 선택한 목록\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+text
         if self.telegram:
-            while not self.stop.is_set():
+            while not self.stop.is_set() and self.state == 'running':
                 try:
                     self.telegram.send_capture(second,caption,silent=bool(changes) and self.config.get('silent_details',False) and all(c.level=='세부' for c in changes))
                     break
                 except DeliveryError as error:
                     if not error.retryable: raise
                     self.emit('status',f'[{error.code}] {error} 전송을 재시도합니다.')
-                    self.stop.wait(max(30,error.retry_after))
-            if self.stop.is_set(): return
+                    if self.wait_interval(max(30,error.retry_after)): return
+            if self.stop.is_set() or self.state != 'running': return
         self.baseline,self.baseline_rows = key,rows
         self.emit('change',(caption,second))
 
     def send_current(self, image, reason):
         caption = 'Alert Bot | '+reason+'\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if self.telegram:
-            while not self.stop.is_set():
+            while not self.stop.is_set() and self.state == 'running':
                 try:
                     self.telegram.send_capture(image,caption)
                     break
                 except DeliveryError as error:
                     if not error.retryable: raise
                     self.emit('status',f'[{error.code}] {error} 캡처 전송 재시도 중')
-                    self.stop.wait(max(30,error.retry_after))
-            if self.stop.is_set(): return
+                    if self.wait_interval(max(30,error.retry_after)): return
+            if self.stop.is_set() or self.state != 'running': return
         self.emit('change',(caption,image))
 
-    def accepts_command(self, update):
+    def command(self, update):
         message = update.get('message',{})
         if str(message.get('chat',{}).get('id')) != self.telegram.chat_id:
-            return False
+            return None
         if message.get('date',0) < self.command_since or message.get('from',{}).get('is_bot'):
-            return False
+            return None
         text = message.get('text','').strip().split()
-        if not text: return False
-        command = text[0].lower()
-        return command == '/capture' or command == '/capture@'+self.bot_username.lower()
+        if not text: return None
+        pieces = text[0].lower().split('@')
+        if len(pieces)>2 or (len(pieces)==2 and pieces[1] != self.bot_username.lower()): return None
+        return pieces[0] if pieces[0] in ('/capture','/stop','/restart') else None
+
+    def accepts_command(self, update):
+        return self.command(update) is not None
 
     def poll_commands(self):
         if not self.commands_enabled or time.monotonic() < self.next_poll: return
@@ -178,26 +241,27 @@ class Monitor:
         try:
             if self.bot_username is None:
                 self.bot_username = self.telegram.identity()['username']
-            updates = self.telegram.updates(self.command_offset)
-            requested = False
-            for update in updates:
+            for update in self.telegram.updates(self.command_offset):
                 if self.command_offset is not None and update['update_id'] < self.command_offset: continue
                 self.command_offset = update['update_id']+1
-                requested = self.accepts_command(update) or requested
-            if requested:
-                # No refresh or baseline change: send the current EMR client only.
-                self.send_current(self.capture(),'수동 캡처 /capture')
+                command = self.command(update)
+                if command == '/stop':
+                    self.capture_requested = False
+                    self.pause('Telegram /stop 명령')
+                elif command == '/restart': self.restart()
+                elif command == '/capture':
+                    if self.state == 'running': self.capture_requested = True
+                    else: self.notices.put('현재 감시 대기 중입니다. /restart 후 /capture를 요청하세요.')
         except DeliveryError as error:
-            if error.retryable:
-                self.next_poll = time.monotonic()+max(30,error.retry_after)
-            else:
-                self.commands_enabled = False
-            self.emit('status',f'명령 수신 오류 [{error.code}]: {error} 자동 감시는 계속됩니다.')
+            self.next_poll = time.monotonic()+max(30,error.retry_after)
+            self.emit('status',f'명령 수신 오류 [{error.code}]: {error} 30초 이후 다시 확인합니다.')
 
     def wait_interval(self, seconds):
         deadline = time.monotonic()+seconds
         while not self.stop.is_set():
             self.poll_commands()
+            self.check_lifecycle()
+            if self.state != 'running': return True
             remaining = deadline-time.monotonic()
             if remaining <= 0: return False
             if self.stop.wait(min(2,remaining)): return True
@@ -205,37 +269,36 @@ class Monitor:
 
     def run(self):
         try:
-            if self.stop.wait(2): return
-            self.desktop.activate()
-            if self.stop.wait(.5): return
-            initial = self.capture()
             self.deadline = time.monotonic()+self.hours*3600 if self.hours else None
-            with self.desktop_lock:
-                self.desktop.arm_user_input()
             self.watch_thread = threading.Thread(target=self.watch,daemon=True)
             self.watch_thread.start()
-            self.emit('watching', self.desktop.window)
-            self.setup(initial)
-            self.send_current(initial,'감시 시작 · 현재 화면')
-            if self.stop.is_set(): return
-            self.emit('status','사용 중 · 자동 조회와 /capture 명령 대기')
             while not self.stop.is_set():
-                if idle_seconds() < 3:
-                    if self.stop.wait(1): break
-                    continue
-                with self.desktop_lock:
-                    # Keep the original input tick: never erase intervening user input.
-                    self.desktop.click('query',self.config['query_rect'])
-                started = time.monotonic()
-                if self.stop.wait(3): break
-                first = self.capture()
-                if self.stop.wait(2): break
-                second = self.capture()
-                self.process(first,second)
-                if self.wait_interval(max(0,self.config['interval']-(time.monotonic()-started))): break
-        except (ValueError,GuardError,DeliveryError) as error:
-            self.request_stop(str(error))
-            self.emit('error',str(error))
+                try:
+                    self.poll_commands()
+                    self.flush_notices()
+                    if self.state == 'recovering': self.recover()
+                    if self.state != 'running':
+                        self.stop.wait(.5)
+                        continue
+                    if self.capture_requested:
+                        self.capture_requested = False
+                        self.send_current(self.capture(),'수동 캡처 /capture')
+                    if time.monotonic() < self.next_query:
+                        self.wait_interval(min(2,self.next_query-time.monotonic()))
+                        continue
+                    with self.desktop_lock:
+                        if self.state != 'running' or self.stop.is_set(): continue
+                        self.desktop.click('query',self.config['query_rect'])
+                    self.next_query = time.monotonic()+self.config['interval']
+                    if self.wait_interval(3): continue
+                    first = self.capture()
+                    if self.wait_interval(2): continue
+                    second = self.capture()
+                    self.process(first,second)
+                except GuardError as error:
+                    self.pause(str(error),automatic=error.recoverable)
+                except (ValueError,DeliveryError) as error:
+                    self.pause(str(error))
         except Exception as error:
             self.request_stop(f'감시 오류 ({type(error).__name__}).')
             self.emit('error',self.stop_reason)

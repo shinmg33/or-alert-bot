@@ -38,7 +38,19 @@ u.EnumWindows.argtypes = [CALLBACK, W.LPARAM]
 
 
 class GuardError(Exception):
-    pass
+    def __init__(self, message, recoverable=True):
+        super().__init__(message)
+        self.recoverable = recoverable
+
+
+# Exact handles of our own capture-excluded outline; never ignore other windows.
+OUTLINE_HANDLES = set()
+
+
+def belongs_to_target(hit, target):
+    root = u.GetAncestor(hit, 2)
+    return root == target or root in OUTLINE_HANDLES
+
 
 
 @dataclass
@@ -122,9 +134,10 @@ class Desktop:
 
     def activate(self):
         if not u.IsWindow(self.window.handle) or title(self.window.handle) != self.window.title:
-            raise GuardError('EMR 목록 창이 바뀌었습니다. 다시 열어주세요.')
+            raise GuardError('EMR 목록 창이 바뀌었습니다. 다시 열어주세요.', False)
         if u.IsIconic(self.window.handle):
-            raise GuardError('EMR 목록 창을 최소화 해제해주세요.')
+            u.ShowWindow.argtypes = [W.HWND, C.c_int]
+            u.ShowWindow(self.window.handle, 9)
         u.SetForegroundWindow(self.window.handle)
 
     def guard(self):
@@ -138,16 +151,16 @@ class Desktop:
         if not u.IsWindow(hwnd) or u.IsIconic(hwnd) or u.GetForegroundWindow() != hwnd:
             raise GuardError('EMR 목록 창을 맨 앞으로 두세요. 입력과 감시를 중단했습니다.')
         if title(hwnd) != self.window.title or executable(hwnd) != self.window.executable:
-            raise GuardError('대상 창이 변경되었습니다.')
+            raise GuardError('대상 창이 변경되었습니다.', False)
         box = client_box(hwnd)
         if self.size and tuple(self.size) != (box[2] - box[0], box[3] - box[1]):
-            raise GuardError('창 크기 또는 배율이 변경되었습니다. 화면 설정을 다시 하세요.')
+            raise GuardError('창 크기 또는 배율이 변경되었습니다. 화면 설정을 다시 하세요.', False)
         # An overlay at any sampled part of the client makes capture/input unsafe.
         for fx in (0.02, 0.25, 0.5, 0.75, 0.98):
             for fy in (0.02, 0.25, 0.5, 0.75, 0.98):
                 point = W.POINT(int(box[0] + (box[2]-box[0])*fx), int(box[1] + (box[3]-box[1])*fy))
                 hit = u.WindowFromPoint(point)
-                if u.GetAncestor(hit, 2) != hwnd:
+                if not belongs_to_target(hit, hwnd):
                     raise GuardError('다른 창이 EMR을 가리고 있습니다.')
         return box
 
@@ -167,7 +180,7 @@ class Desktop:
         y = box[1] + (rectangle[1] + rectangle[3]) // 2
         if not (box[0] <= x < box[2] and box[1] <= y < box[3]):
             raise GuardError('입력 위치가 EMR 창 밖입니다.')
-        if u.GetAncestor(u.WindowFromPoint(W.POINT(x, y)), 2) != self.window.handle:
+        if not belongs_to_target(u.WindowFromPoint(W.POINT(x, y)), self.window.handle):
             raise GuardError('입력 위치가 가려져 있습니다.')
         u.SetCursorPos(x, y)
         self.expected_input = input_tick()

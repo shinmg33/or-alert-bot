@@ -24,12 +24,15 @@ class LifecycleTest(unittest.TestCase):
 
     def test_user_input_during_interval_preserves_reason(self):
         m,_=self.monitor()
+        m.state='running'
         m.desktop.expected_input=1
         with patch.object(m.desktop,'guard',side_effect=GuardError('사용자 입력 감지')):
             m.check_lifecycle()
-        self.assertTrue(m.stop.is_set())
-        m.request_stop('다른 사유')
-        self.assertEqual(m.stop_reason,'사용자 입력 감지')
+        self.assertFalse(m.stop.is_set())
+        self.assertEqual(m.state,'recovering')
+        m.pause('수동 정지')
+        m.pause('다른 가림',automatic=True)
+        self.assertEqual(m.state,'paused')
 
     def test_notice_sent_after_stop_event(self):
         class Client:
