@@ -133,11 +133,12 @@ class Telegram:
                     found[str(chat['id'])] = chat.get('title', '그룹')
         return found
 
-    def send_notice(self, text):
+    def send_notice(self, text, silent=True):
         if self.chat_id is None:
             raise ValueError('먼저 수신 그룹을 선택하세요.')
         return self._call('sendMessage', urllib.parse.urlencode({
-            'chat_id': self.chat_id, 'text': text, 'protect_content': 'true'
+            'chat_id': self.chat_id, 'text': text, 'protect_content': 'true',
+            'disable_notification': str(silent).lower()
         }).encode(), 'application/x-www-form-urlencoded')
 
     def updates(self, offset=None):

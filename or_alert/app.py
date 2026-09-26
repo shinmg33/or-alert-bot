@@ -93,7 +93,9 @@ class App(tk.Tk):
         self.shutdown = tk.StringVar(value=str(self.config.get('shutdown_hours', 0)))
         self.interval = tk.StringVar(value=str(self.config.get('interval', 60)))
         self.preview = tk.BooleanVar(value=self.config.get('preview', False))
-        self.silent = tk.BooleanVar(value=self.config.get('silent_details', False))
+        self.mode_choice = tk.StringVar(value='시험 모드 (전송 안 함)' if self.preview.get() else 'Telegram 전송')
+        self.change_choice = tk.StringVar(value='무음' if self.config.get('change_notifications') == 'silent' else '소리 알림')
+        self.system_choice = tk.StringVar(value={'off':'보내지 않음','sound':'소리 알림'}.get(self.config.get('system_notifications'),'무음'))
         self.status = tk.StringVar(value='중지됨 · EMR에서 조건을 선택하고 조회 버튼 위치를 지정하세요.')
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.build()
@@ -131,8 +133,14 @@ class App(tk.Tk):
         ttk.Label(expiry, text='자동 종료 (시간, 0 = 사용 안 함)').pack(side='left')
         ttk.Spinbox(expiry, from_=0, to=168, increment=.5, textvariable=self.shutdown, width=10).pack(side='left', padx=12)
         ttk.Label(settings, text='감시 중인 EMR은 초록색 테두리로 표시됩니다. 중단 사유는 Telegram으로 알립니다.').pack(anchor='w', pady=4)
-        ttk.Checkbutton(settings, text='로컬 시험 모드: 화면 확인만 하고 텔레그램에 보내지 않음', variable=self.preview).pack(anchor='w', pady=4)
-        ttk.Checkbutton(settings, text='세부 변경은 무음 알림', variable=self.silent).pack(anchor='w', pady=4)
+        for label, variable, values in [
+            ('실행 모드', self.mode_choice, ['Telegram 전송','시험 모드 (전송 안 함)']),
+            ('실제 목록 변경 알림', self.change_choice, ['소리 알림','무음']),
+            ('시스템 안내', self.system_choice, ['무음','보내지 않음','소리 알림'])]:
+            option = ttk.Frame(settings)
+            option.pack(fill='x', pady=3)
+            ttk.Label(option, text=label, width=24).pack(side='left')
+            ttk.Combobox(option, textvariable=variable, values=values, state='readonly', width=25).pack(side='left')
         ttk.Label(settings, text='진료과·진료의·수술일은 사람이 설정합니다. 봇은 조회만 누릅니다.\n변경된 화면을 전송하며, 표 구분이 가능하면 주요/세부 알림으로 표시합니다.', justify='left').pack(anchor='w', pady=8)
         ttk.Button(settings, text='조회 버튼 위치 지정', command=self.capture_setup).pack(anchor='w', pady=8)
 
@@ -209,9 +217,10 @@ class App(tk.Tk):
         self.after(1500, take)
 
     def collect(self):
+        self.preview.set(self.mode_choice.get() != 'Telegram 전송')
         config = dict(self.config)
         config.update(token=self.token.get().strip(), chat_id=self.chat.get().strip(),
-                      interval=validate_interval(self.interval.get()), silent_details=self.silent.get(), preview=self.preview.get(), shutdown_hours=shutdown_hours(self.shutdown.get()))
+                      interval=validate_interval(self.interval.get()), change_notifications='silent' if self.change_choice.get() == '무음' else 'sound', system_notifications={'무음':'silent','보내지 않음':'off','소리 알림':'sound'}[self.system_choice.get()], preview=self.preview.get(), shutdown_hours=shutdown_hours(self.shutdown.get()))
         config.pop('departments', None)
         config.pop('control_overrides', None)
         return config

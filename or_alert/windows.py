@@ -128,6 +128,7 @@ class Desktop:
     def __init__(self, window, size=None, stopped=lambda: False):
         self.window, self.size, self.stopped = window, size, stopped
         self.expected_input = None
+        self.critical_regions = None
 
     def arm_user_input(self):
         self.expected_input = input_tick()
@@ -148,20 +149,23 @@ class Desktop:
             raise GuardError('감시 동작 중 사용자 입력을 감지해 중단했습니다.')
         if any(u.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12)):
             raise GuardError('Shift·Ctrl·Alt가 눌려 있어 입력을 중단했습니다.')
-        if not u.IsWindow(hwnd) or u.IsIconic(hwnd) or u.GetForegroundWindow() != hwnd:
+        if not u.IsWindow(hwnd) or u.IsIconic(hwnd) or (self.critical_regions is None and u.GetForegroundWindow() != hwnd):
             raise GuardError('EMR 목록 창을 맨 앞으로 두세요. 입력과 감시를 중단했습니다.')
         if title(hwnd) != self.window.title or executable(hwnd) != self.window.executable:
             raise GuardError('대상 창이 변경되었습니다.', False)
         box = client_box(hwnd)
         if self.size and tuple(self.size) != (box[2] - box[0], box[3] - box[1]):
             raise GuardError('창 크기 또는 배율이 변경되었습니다. 화면 설정을 다시 하세요.', False)
-        # An overlay at any sampled part of the client makes capture/input unsafe.
-        for fx in (0.02, 0.25, 0.5, 0.75, 0.98):
-            for fy in (0.02, 0.25, 0.5, 0.75, 0.98):
-                point = W.POINT(int(box[0] + (box[2]-box[0])*fx), int(box[1] + (box[3]-box[1])*fy))
-                hit = u.WindowFromPoint(point)
-                if not belongs_to_target(hit, hwnd):
-                    raise GuardError('다른 창이 EMR을 가리고 있습니다.')
+        regions = self.critical_regions or [(0,0,box[2]-box[0],box[3]-box[1])]
+        for left,top,right,bottom in regions:
+            # Check the query and visible table, not empty workspace or unrelated controls.
+            xs = list(range(left+2,max(left+3,right-2),60))+[(left+right)//2,right-3]
+            ys = list(range(top+2,max(top+3,bottom-2),12))+[(top+bottom)//2,bottom-3]
+            for x in xs:
+                for y in ys:
+                    hit = u.WindowFromPoint(W.POINT(box[0]+x,box[1]+y))
+                    if not belongs_to_target(hit, hwnd):
+                        raise GuardError('조회 버튼 또는 수술 목록이 가려져 잠시 대기합니다.')
         return box
 
     def capture(self):

@@ -37,7 +37,7 @@ class LifecycleTest(unittest.TestCase):
     def test_notice_sent_after_stop_event(self):
         class Client:
             def __init__(self): self.sent=[]
-            def send_notice(self,text): self.sent.append(text)
+            def send_notice(self,text,**kwargs): self.sent.append(text)
         client=Client();m,_=self.monitor(client)
         m.request_stop('사용자 입력 감지')
         m.notify_stopped()
@@ -46,7 +46,7 @@ class LifecycleTest(unittest.TestCase):
 
     def test_failed_notice_visible_locally(self):
         class Client:
-            def send_notice(self,text): raise DeliveryError('네트워크 오류',code='NETWORK')
+            def send_notice(self,text,**kwargs): raise DeliveryError('네트워크 오류',code='NETWORK')
         m,events=self.monitor(Client())
         m.request_stop('중지')
         m.notify_stopped()

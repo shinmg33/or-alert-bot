@@ -20,6 +20,12 @@ with patch('or_alert.app.list_windows', return_value=[]), patch('or_alert.app.lo
     assert app.interval.get() == '60'
     assert not hasattr(app, 'depts')
     assert 'departments' not in app.collect()
+    assert app.collect()['system_notifications'] == 'silent'
+    assert app.collect()['change_notifications'] == 'sound'
+    app.system_choice.set('보내지 않음')
+    app.change_choice.set('무음')
+    assert app.collect()['system_notifications'] == 'off'
+    assert app.collect()['change_notifications'] == 'silent'
     app.destroy()
 '''
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=15)

@@ -13,7 +13,7 @@ class RecoveryTest(unittest.TestCase):
             def __init__(self): self.pending=[];self.sent=[]
             def identity(self):return {'username':'OurBot'}
             def updates(self,offset):return self.pending
-            def send_notice(self,text):self.sent.append(text)
+            def send_notice(self,text,**kwargs):self.sent.append(text)
             def send_capture(self,*args,**kwargs):pass
         client=Client()
         m=Monitor(Window(0,'fake','fake'),{'interval':30,'query_rect':[160,5,190,20],'query_size':[200,140]},threading.Event(),lambda *args:None,client)
@@ -23,6 +23,7 @@ class RecoveryTest(unittest.TestCase):
             def __init__(self):self.activations=0
             def activate(self):self.activations+=1
             def arm_user_input(self):pass
+            def guard(self):pass
             def capture(self):return Image.new('RGB',(200,140),'white')
         m.desktop=Desktop()
         m.state='running'

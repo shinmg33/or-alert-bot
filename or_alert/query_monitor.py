@@ -51,6 +51,9 @@ class Monitor:
         self.initial_sent = False
         self.next_query = 0
         self.next_recovery = 0
+        self.automatic_pause_since = None
+        self.pause_reported = False
+        self.desktop.critical_regions = [config['query_rect']]
 
     def request_stop(self, reason):
         first = False
@@ -71,7 +74,12 @@ class Monitor:
             self.state = target
             self.emit('paused', reason)
             suffix = ' 입력이 5초 이상 없으면 자동 복구합니다.' if automatic else ' /restart로 재개할 수 있습니다.'
-            self.notices.put('감시 대기: '+reason+suffix)
+            if automatic:
+                self.automatic_pause_since = time.monotonic()
+                self.pause_reported = False
+            else:
+                self.automatic_pause_since = None
+                self.notices.put('감시 대기: '+reason+suffix)
 
     def restart(self):
         with self.desktop_lock:
@@ -95,11 +103,14 @@ class Monitor:
                     self.pause(str(error), automatic=error.recoverable)
 
     def flush_notices(self):
+        if self.state == 'recovering' and self.automatic_pause_since is not None and not self.pause_reported and time.monotonic()-self.automatic_pause_since >= 120:
+            self.notices.put('핵심 영역 또는 사용자 입력 때문에 2분 이상 감시를 기다리고 있습니다.')
+            self.pause_reported = True
         while not self.notices.empty():
-            text = 'Alert Bot | '+self.notices.get()
+            text = 'Alert Bot | [시스템] '+self.notices.get()
             self.emit('status',text)
-            if self.telegram:
-                try: self.telegram.send_notice(text)
+            if self.telegram and self.config.get('system_notifications','silent') != 'off':
+                try: self.telegram.send_notice(text, silent=self.config.get('system_notifications','silent') != 'sound')
                 except DeliveryError as error:
                     self.emit('status',f'상태 알림 실패 [{error.code}]: {error}')
 
@@ -116,14 +127,18 @@ class Monitor:
             if self.state != 'recovering': return False
             image = self.desktop.capture()
             self.setup(image)
+            self.update_regions(image)
+            self.desktop.guard()
             self.state = 'running'
             self.next_query = 0
             self.emit('watching', self.desktop.window)
         if not self.initial_sent:
             self.send_current(image,'감시 시작 · 현재 화면')
             self.initial_sent = True
-        else:
+        elif self.pause_reported:
             self.notices.put('EMR 화면 확인 완료. 감시를 재개했습니다.')
+        self.automatic_pause_since = None
+        self.pause_reported = False
         return True
 
     def watch(self):
@@ -133,15 +148,35 @@ class Monitor:
 
     def capture(self):
         with self.desktop_lock:
-            return self.desktop.capture()
+            image = self.desktop.capture()
+            self.update_regions(image)
+            self.desktop.guard()
+            return image
+
+    def visible_region(self, image):
+        if not self.columns: return self.region
+        left,top,right,bottom = self.region
+        boundaries = row_boundaries(image.crop(self.region),self.header_height)
+        last = self.header_height-1
+        for value in boundaries[1:]:
+            if not 12 <= value-last <= 80: break
+            last = value
+        return (left,top,right,min(bottom,top+last+2))
+
+    def update_regions(self, image):
+        if self.region:
+            self.desktop.critical_regions = [self.config['query_rect'],self.visible_region(image)]
+
+    def notification_image(self, image):
+        return image.crop(self.visible_region(image)) if self.region else image
 
     def notify_stopped(self):
         reason = self.stop_reason or '사용자가 감시를 중지했습니다.'
-        text = 'Alert Bot | 감시 중단\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+reason
+        text = 'Alert Bot | [시스템] 감시 중단\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+reason
         self.emit('status',text)
-        if self.telegram:
+        if self.telegram and self.config.get('system_notifications','silent') != 'off':
             try:
-                self.telegram.send_notice(text)
+                self.telegram.send_notice(text, silent=self.config.get('system_notifications','silent') != 'sound')
             except DeliveryError as error:
                 self.emit('error',f'감시는 중단됐지만 중단 알림 전송 실패 [{error.code}]: {error}')
             except Exception:
@@ -167,7 +202,7 @@ class Monitor:
                             for name,i in [('등록번호',9),('수술명',12),('환자상태',19)]}
 
     def sample(self, image):
-        table = image.crop(self.region)
+        table = image.crop(self.visible_region(image))
         rows = None
         if self.columns:
             try:
@@ -192,11 +227,11 @@ class Monitor:
             return
         changes = compare(self.baseline_rows,rows) if self.baseline_rows is not None and rows is not None else []
         text = '\n'.join(f'[{c.level}] {c.message}' for c in changes) or '[변경] 화면 내용 변경 — 캡처 확인'
-        caption = 'Alert Bot | 현재 선택한 목록\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+text
+        caption = 'Alert Bot | [목록 변경] 현재 선택한 목록\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+text
         if self.telegram:
             while not self.stop.is_set() and self.state == 'running':
                 try:
-                    self.telegram.send_capture(second,caption,silent=bool(changes) and self.config.get('silent_details',False) and all(c.level=='세부' for c in changes))
+                    self.telegram.send_capture(self.notification_image(second),caption,silent=self.config.get('change_notifications','sound') == 'silent')
                     break
                 except DeliveryError as error:
                     if not error.retryable: raise
@@ -211,7 +246,7 @@ class Monitor:
         if self.telegram:
             while not self.stop.is_set() and self.state == 'running':
                 try:
-                    self.telegram.send_capture(image,caption)
+                    self.telegram.send_capture(self.notification_image(image),caption,silent=self.config.get('system_notifications','silent') != 'sound')
                     break
                 except DeliveryError as error:
                     if not error.retryable: raise

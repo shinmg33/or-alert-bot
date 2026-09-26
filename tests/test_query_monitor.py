@@ -51,6 +51,7 @@ class QueryOnlyTest(unittest.TestCase):
             def __init__(self): self.actions=[]
             def activate(self): pass
             def arm_user_input(self): pass
+            def guard(self): pass
             def capture(self): return Image.new('RGB',(200,140),'white')
             def click(self,kind,rect): self.actions.append(kind); m.stop.set()
         m.desktop=Desktop()
@@ -83,12 +84,13 @@ class CommandsTest(QueryOnlyTest):
         image=self.image('fresh')
         class Desktop:
             def capture(self): return image
+            def guard(self): pass
         m.desktop=Desktop(); m.baseline='unchanged'
         client.pending=[self.update(m)]
         m.poll_commands()
         self.assertTrue(m.capture_requested)
         m.send_current(m.capture(),'수동 캡처 /capture')
-        self.assertIs(client.sent[0][0],image)
+        self.assertEqual(client.sent[0][0].tobytes(),m.notification_image(image).tobytes())
         self.assertEqual(m.baseline,'unchanged')
         m.next_poll=0; m.poll_commands()
         self.assertEqual(len(client.sent),1)
