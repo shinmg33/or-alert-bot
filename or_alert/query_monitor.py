@@ -1,11 +1,23 @@
 """Query-only monitoring. No OCR and no department/doctor input."""
 import time
+import threading
+import math
 from datetime import datetime
 from .core import compare, validate_interval
 from .layout import detect_grid, LayoutError
 from .visual import digest, row_boundaries, visual_snapshot
 from .windows import Desktop, GuardError, idle_seconds
 from .telegram import DeliveryError
+
+
+def shutdown_hours(value):
+    try:
+        value = float(value or 0)
+    except (ValueError, TypeError):
+        raise ValueError('자동 종료 시간은 0~168시간으로 입력하세요. 0은 사용 안 함입니다.') from None
+    if not math.isfinite(value) or not 0 <= value <= 168:
+        raise ValueError('자동 종료 시간은 0~168시간으로 입력하세요. 0은 사용 안 함입니다.')
+    return value
 
 
 class Monitor:
@@ -24,6 +36,58 @@ class Monitor:
         self.bot_username = None
         self.commands_enabled = bool(telegram)
         self.next_poll = 0
+        self.hours = shutdown_hours(config.get('shutdown_hours', 0))
+        self.deadline = None
+        self.timed_out = False
+        self.stop_reason = None
+        self.reason_lock = threading.Lock()
+        self.desktop_lock = threading.RLock()
+        self.watch_done = threading.Event()
+        self.watch_thread = None
+
+    def request_stop(self, reason):
+        first = False
+        with self.reason_lock:
+            if self.stop_reason is None:
+                self.stop_reason = reason
+                first = True
+        self.stop.set()
+        if first:
+            self.emit('stopping', self.stop_reason)
+
+    def check_lifecycle(self):
+        if self.stop.is_set(): return
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.timed_out = True
+            self.request_stop(f'예약한 {self.hours:g}시간이 지나 자동 종료했습니다.')
+            return
+        with self.desktop_lock:
+            if self.desktop.expected_input is not None:
+                try:
+                    self.desktop.guard()
+                except GuardError as error:
+                    self.request_stop(str(error))
+
+    def watch(self):
+        while not self.watch_done.wait(.25):
+            self.check_lifecycle()
+            if self.stop.is_set(): break
+
+    def capture(self):
+        with self.desktop_lock:
+            return self.desktop.capture()
+
+    def notify_stopped(self):
+        reason = self.stop_reason or '사용자가 감시를 중지했습니다.'
+        text = 'Alert Bot | 감시 중단\n'+datetime.now().strftime('%Y-%m-%d %H:%M:%S')+'\n'+reason
+        self.emit('status',text)
+        if self.telegram:
+            try:
+                self.telegram.send_notice(text)
+            except DeliveryError as error:
+                self.emit('error',f'감시는 중단됐지만 중단 알림 전송 실패 [{error.code}]: {error}')
+            except Exception:
+                self.emit('error','감시는 중단됐지만 중단 알림 전송에 실패했습니다.')
 
     def setup(self, image):
         x1,y1,x2,y2 = self.config['query_rect']
@@ -122,7 +186,7 @@ class Monitor:
                 requested = self.accepts_command(update) or requested
             if requested:
                 # No refresh or baseline change: send the current EMR client only.
-                self.send_current(self.desktop.capture(),'수동 캡처 /capture')
+                self.send_current(self.capture(),'수동 캡처 /capture')
         except DeliveryError as error:
             if error.retryable:
                 self.next_poll = time.monotonic()+max(30,error.retry_after)
@@ -144,7 +208,13 @@ class Monitor:
             if self.stop.wait(2): return
             self.desktop.activate()
             if self.stop.wait(.5): return
-            initial = self.desktop.capture()
+            initial = self.capture()
+            self.deadline = time.monotonic()+self.hours*3600 if self.hours else None
+            with self.desktop_lock:
+                self.desktop.arm_user_input()
+            self.watch_thread = threading.Thread(target=self.watch,daemon=True)
+            self.watch_thread.start()
+            self.emit('watching', self.desktop.window)
             self.setup(initial)
             self.send_current(initial,'감시 시작 · 현재 화면')
             if self.stop.is_set(): return
@@ -153,18 +223,25 @@ class Monitor:
                 if idle_seconds() < 3:
                     if self.stop.wait(1): break
                     continue
-                self.desktop.arm_user_input()
-                self.desktop.click('query',self.config['query_rect'])
+                with self.desktop_lock:
+                    # Keep the original input tick: never erase intervening user input.
+                    self.desktop.click('query',self.config['query_rect'])
                 started = time.monotonic()
                 if self.stop.wait(3): break
-                first = self.desktop.capture()
+                first = self.capture()
                 if self.stop.wait(2): break
-                second = self.desktop.capture()
+                second = self.capture()
                 self.process(first,second)
                 if self.wait_interval(max(0,self.config['interval']-(time.monotonic()-started))): break
         except (ValueError,GuardError,DeliveryError) as error:
+            self.request_stop(str(error))
             self.emit('error',str(error))
         except Exception as error:
-            self.emit('error',f'감시 중단 ({type(error).__name__}).')
+            self.request_stop(f'감시 오류 ({type(error).__name__}).')
+            self.emit('error',self.stop_reason)
         finally:
-            self.emit('stopped',None)
+            self.watch_done.set()
+            if self.watch_thread: self.watch_thread.join(timeout=1)
+            self.emit('outline_hide',None)
+            self.notify_stopped()
+            self.emit('stopped',self.timed_out)

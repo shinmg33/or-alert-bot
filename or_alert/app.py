@@ -8,7 +8,8 @@ from .core import validate_interval
 from .storage import load_settings, save_settings
 from .telegram import Telegram, DeliveryError
 from .windows import list_windows, Desktop, dpi_awareness, stop_pressed, GuardError
-from .query_monitor import Monitor
+from .query_monitor import Monitor, shutdown_hours
+from .outline import Outline
 
 
 class Picker(tk.Toplevel):
@@ -70,6 +71,9 @@ class App(tk.Tk):
         self.events = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
+        self.monitor = None
+        self.outline = None
+        self.closing = False
         self.sample = None
         self.latest = None
         self.windows = []
@@ -86,6 +90,7 @@ class App(tk.Tk):
             self.config.pop(key, None)
         self.token = tk.StringVar(value=self.config.get('token', ''))
         self.chat = tk.StringVar(value=self.config.get('chat_id', ''))
+        self.shutdown = tk.StringVar(value=str(self.config.get('shutdown_hours', 0)))
         self.interval = tk.StringVar(value=str(self.config.get('interval', 60)))
         self.preview = tk.BooleanVar(value=self.config.get('preview', False))
         self.silent = tk.BooleanVar(value=self.config.get('silent_details', False))
@@ -121,6 +126,11 @@ class App(tk.Tk):
         timing.pack(fill='x', pady=8)
         ttk.Label(timing, text='조회 간격 (최소 30초)').pack(side='left')
         ttk.Spinbox(timing, from_=30, to=3600, increment=30, textvariable=self.interval, width=10).pack(side='left', padx=12)
+        expiry = ttk.Frame(settings)
+        expiry.pack(fill='x', pady=4)
+        ttk.Label(expiry, text='자동 종료 (시간, 0 = 사용 안 함)').pack(side='left')
+        ttk.Spinbox(expiry, from_=0, to=168, increment=.5, textvariable=self.shutdown, width=10).pack(side='left', padx=12)
+        ttk.Label(settings, text='감시 중인 EMR은 초록색 테두리로 표시됩니다. 중단 사유는 Telegram으로 알립니다.').pack(anchor='w', pady=4)
         ttk.Checkbutton(settings, text='로컬 시험 모드: 화면 확인만 하고 텔레그램에 보내지 않음', variable=self.preview).pack(anchor='w', pady=4)
         ttk.Checkbutton(settings, text='세부 변경은 무음 알림', variable=self.silent).pack(anchor='w', pady=4)
         ttk.Label(settings, text='진료과·진료의·수술일은 사람이 설정합니다. 봇은 조회만 누릅니다.\n변경된 화면을 전송하며, 표 구분이 가능하면 주요/세부 알림으로 표시합니다.', justify='left').pack(anchor='w', pady=8)
@@ -201,7 +211,7 @@ class App(tk.Tk):
     def collect(self):
         config = dict(self.config)
         config.update(token=self.token.get().strip(), chat_id=self.chat.get().strip(),
-                      interval=validate_interval(self.interval.get()), silent_details=self.silent.get(), preview=self.preview.get())
+                      interval=validate_interval(self.interval.get()), silent_details=self.silent.get(), preview=self.preview.get(), shutdown_hours=shutdown_hours(self.shutdown.get()))
         config.pop('departments', None)
         config.pop('control_overrides', None)
         return config
@@ -264,6 +274,7 @@ class App(tk.Tk):
             client = None if self.preview.get() else Telegram(config['token'], config['chat_id'])
             self.stop_event.clear()
             monitor = Monitor(window, config, self.stop_event, lambda kind, data: self.events.put((kind, data)), client)
+            self.monitor = monitor
             self.config = config
             save_settings(config)
             self.worker = threading.Thread(target=monitor.run, daemon=True)
@@ -278,12 +289,15 @@ class App(tk.Tk):
 
     def on_restore(self, event):
         if event.widget is self and self.active() and self.state() == 'normal':
-            self.stop_event.set()
+            self.monitor.request_stop('사용자가 설정 창을 열어 감시를 중지했습니다.')
             self.status.set('설정 창을 열어 감시 중지 중입니다. 다시 시작하려면 감시 시작을 누르세요.')
             self.title('Alert Bot · 중지 중')
 
     def stop(self):
-        self.stop_event.set()
+        if self.monitor:
+            self.monitor.request_stop('사용자가 중지 버튼 또는 F8로 감시를 중지했습니다.')
+        else:
+            self.stop_event.set()
         self.status.set('중지 요청됨 · 진행 중인 전송은 완료까지 최대 20초 걸릴 수 있습니다.')
         self.deiconify()
 
@@ -309,7 +323,23 @@ class App(tk.Tk):
             elif kind == 'change':
                 caption, self.latest = data
                 self.status.set(caption.replace('\n', ' | '))
+            elif kind == 'stopping':
+                self.hide_outline()
+                self.title('Alert Bot · 중단됨 · 알림 전송 중')
+                self.status.set(data)
+            elif kind == 'watching':
+                if not self.stop_event.is_set():
+                    try:
+                        self.outline = Outline(self, data)
+                    except Exception:
+                        self.status.set('감시는 실행 중이나 이 환경에서 테두리 표시를 지원하지 않습니다.')
+            elif kind == 'outline_hide':
+                self.hide_outline()
             elif kind == 'stopped':
+                self.hide_outline()
+                if data or self.closing:
+                    self.destroy()
+                    return
                 self.title(f'Alert Bot {__version__} · 중지됨')
                 self.start_button.configure(state='normal')
                 self.save_button.configure(state='normal')
@@ -332,9 +362,20 @@ class App(tk.Tk):
                         ttk.Button(dialog, text=f'{name} ({chat_id})', command=lambda c=chat_id: (self.chat.set(c), dialog.destroy())).pack(fill='x', padx=12, pady=4)
         self.after(150, self.poll)
 
+    def hide_outline(self):
+        if self.outline:
+            self.outline.close()
+            self.outline = None
+
     def close(self):
-        self.stop_event.set()
-        self.destroy()
+        self.hide_outline()
+        if self.active():
+            self.closing = True
+            self.monitor.request_stop('사용자가 Alert Bot을 종료했습니다.')
+            self.title('Alert Bot · 중단 알림 전송 후 종료 중')
+            self.status.set('중단 알림 전송 후 종료합니다. 네트워크 응답은 최대 20초 걸릴 수 있습니다.')
+        else:
+            self.destroy()
 
 
 def main():

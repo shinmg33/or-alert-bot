@@ -44,13 +44,14 @@ class QueryOnlyTest(unittest.TestCase):
     def test_run_only_clicks_query(self):
         m,_=self.monitor()
         class Desktop:
-            def __init__(self): self.actions=[]
+            def __init__(self): self.actions=[]; self.window=Window(0,'fake','fake'); self.expected_input=None
             def activate(self): pass
             def arm_user_input(self): pass
             def capture(self): return Image.new('RGB',(200,140),'white')
             def click(self,kind,rect): self.actions.append(kind)
         class Stop:
             def __init__(self): self.calls=0
+            def set(self): pass
             def is_set(self): return False
             def wait(self,_):
                 self.calls+=1
