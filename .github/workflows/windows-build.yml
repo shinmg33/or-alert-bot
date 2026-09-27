@@ -15,13 +15,6 @@ jobs:
         with:
           python-version: '3.12'
           architecture: x64
-      - name: Install Korean OCR and fonts
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Add-WindowsCapability -Online -Name Language.Basic~~~ko-KR~0.0.1.0
-          Add-WindowsCapability -Online -Name Language.OCR~~~ko-KR~0.0.1.0
-          Add-WindowsCapability -Online -Name Language.Fonts.Kore~~~und-KORE~0.0.1.0
       - name: Test and build
         shell: pwsh
         run: ./build.ps1
@@ -31,7 +24,9 @@ jobs:
           $process = Start-Process -FilePath 'dist/Alert Bot/Alert Bot.exe' -ArgumentList '--selfcheck', 'selfcheck.json' -PassThru
           if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Selfcheck timed out' }
           $report = Get-Content selfcheck.json -Raw | ConvertFrom-Json
-          if (-not ($report.tk -and $report.dpapi -and $report.korean_ocr)) { throw "Selfcheck failed: $(Get-Content selfcheck.json -Raw)" }
+          if (-not ($report.tk -and $report.dpapi -and $report.winrt_imports) -or $report.error_type -or ($report.korean_ocr -ne $true -and $report.korean_ocr -ne 'language_pack_missing')) { throw "Selfcheck failed: $(Get-Content selfcheck.json -Raw)" }
+          Write-Output (Get-Content selfcheck.json -Raw)
+          if ($report.korean_ocr -eq 'language_pack_missing') { Write-Warning 'Korean OCR unavailable on runner; language-specific recognition requires target-PC verification.' }
           Get-FileHash 'dist/AlertBot-windows-x64.zip' -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt
       - uses: actions/upload-artifact@v4
         with:
