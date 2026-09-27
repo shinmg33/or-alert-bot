@@ -113,7 +113,7 @@ class App(tk.Tk):
         title = ttk.Frame(self, padding=18)
         title.pack(fill='x')
         ttk.Label(title, text='Alert Bot', font=('맑은 고딕', 22, 'bold')).pack(anchor='w')
-        ttk.Label(title, text='EMR에서 진료과·진료의를 직접 선택하세요. 봇은 조회 버튼만 누릅니다.').pack(anchor='w', pady=(4, 0))
+        ttk.Label(title, text='화면 변경 알림 · Telegram에서 수술일과 진료과 선택').pack(anchor='w', pady=(4, 0))
         book = ttk.Notebook(self)
         book.pack(fill='both', expand=True, padx=18)
         settings = ttk.Frame(book, padding=18)
@@ -143,8 +143,12 @@ class App(tk.Tk):
             option.pack(fill='x', pady=3)
             ttk.Label(option, text=label, width=24).pack(side='left')
             ttk.Combobox(option, textvariable=variable, values=values, state='readonly', width=25).pack(side='left')
-        ttk.Label(settings, text='진료과·진료의·수술일은 사람이 설정합니다. 봇은 조회만 누릅니다.\n변경된 화면을 전송하며, 표 구분이 가능하면 주요/세부 알림으로 표시합니다.', justify='left').pack(anchor='w', pady=8)
+        ttk.Label(settings, text='수술일과 진료과는 아래에서 위치를 등록하면 Telegram으로 변경할 수 있습니다.\n기본 캡처에는 상단 조건과 목록 아래 여백이 포함됩니다.', justify='left').pack(anchor='w', pady=8)
         ttk.Button(settings, text='조회 버튼 위치 지정', command=self.capture_setup).pack(anchor='w', pady=8)
+        remote = ttk.Frame(settings)
+        remote.pack(fill='x')
+        for label, mode in [('날짜·진료과 위치 지정', 'controls'), ('펼친 달력 위치 지정', 'calendar'), ('전송 캡처 영역 지정', 'capture')]:
+            ttk.Button(remote, text=label, command=lambda mode=mode: self.configure_regions(mode)).pack(side='left', padx=(0, 5))
 
         ttk.Label(connection, text='BotFather에서 받은 API 토큰').pack(anchor='w')
         ttk.Entry(connection, textvariable=self.token, show='•', width=75).pack(fill='x', pady=6)
@@ -158,7 +162,7 @@ class App(tk.Tk):
             button.pack(side='left', padx=(0, 6))
             self.network_buttons.append(button)
         ttk.Label(connection, text='① 토큰 입력 → 연결 진단\n② 비공개 그룹에 봇 추가\n③ 그룹에서 /start@봇사용자이름 전송 → 그룹 찾기\n④ 그룹 선택 → 테스트 메시지 보내기', justify='left').pack(anchor='w', pady=8)
-        ttk.Label(connection, text='그룹 명령: /capture 현재 화면 · /stop 감시 대기 · /restart 재시작\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
+        ttk.Label(connection, text='그룹 명령: /date 2026-09-29 · /dept 산부인과 · /help\n/capture 현재 화면 · /stop 감시 대기 · /restart 재시작\n날짜·진료과 확인에는 Windows 한국어 OCR을 사용합니다.\n토큰은 이 Windows 계정으로 암호화 저장합니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
 
         bottom = ttk.Frame(self, padding=18)
         bottom.pack(fill='x')
@@ -230,6 +234,84 @@ class App(tk.Tk):
         self.capture_busy = False
         if self.monitor:
             self.monitor.end_calibration()
+
+    def configure_regions(self, mode):
+        if self.capture_busy:
+            return
+        try:
+            window = self.chosen_window()
+            if not self.config.get('query_size'):
+                raise ValueError('조회 버튼 위치를 먼저 지정하세요.')
+        except ValueError as error:
+            messagebox.showerror('위치 지정', str(error))
+            return
+        steps = {
+            'controls': [('date', '수술일 숫자만 (예: 2026-09-28)'),
+                         ('calendar_button', '수술일 옆 캘린더 아이콘만'),
+                         ('department', '현재 진료과 글자 영역 (아래 화살표 제외)'),
+                         ('department_button', '진료과 오른쪽 아래 화살표 버튼만')],
+            'calendar': [('calendar_title', '펼친 달력의 연월 글자만 (예: 2026.09)'),
+                         ('calendar_prev', '달력 왼쪽 이전 달 화살표'),
+                         ('calendar_next', '달력 오른쪽 다음 달 화살표'),
+                         ('calendar_grid', '요일 줄을 제외한 날짜 숫자 전체: 일~토 7열, 회색 날짜까지 6행')],
+            'capture': [('capture_rect', '수술일·진료과와 목록 아래까지 포함할 전송 영역')]
+        }[mode]
+        if mode == 'calendar':
+            messagebox.showinfo('달력 캡처', '확인을 누르면 봇이 숨겨집니다. 5초 안에 EMR의 캘린더 아이콘을 눌러 달력을 펼쳐두세요. 펼친 화면을 한 번 캡처해 네 위치를 지정합니다.')
+        self.capture_busy = True
+        if self.active(): self.monitor.begin_calibration()
+        self.hide_outline()
+        self.withdraw()
+        def take():
+            try:
+                desktop = Desktop(window)
+                if mode != 'calendar': desktop.activate()
+                sample = desktop.capture_preview()
+                if list(sample.size) != self.config['query_size']:
+                    raise ValueError('창 크기가 다릅니다. 조회 버튼부터 다시 지정하세요.')
+                self.deiconify()
+                selected = {}
+                committed = False
+                def next_step(index):
+                    nonlocal committed
+                    if index == len(steps):
+                        if mode == 'capture':
+                            self.config.update(selected)
+                        else:
+                            controls = dict(self.config.get('remote_controls', {}))
+                            if controls.get('size') != list(sample.size): controls = {}
+                            controls.update(selected, size=list(sample.size))
+                            self.config['remote_controls'] = controls
+                        if self.active():
+                            with self.monitor.desktop_lock:
+                                self.monitor.config.update(self.config)
+                        committed = True
+                        try:
+                            save_settings(self.config)
+                            self.status.set('위치 지정·저장 완료. 펼친 달력은 닫고 감시 재시작을 누르세요.')
+                        except Exception:
+                            self.status.set('위치는 적용됐지만 저장에 실패했습니다.')
+                        self.finish_calibration()
+                        return
+                    key, label = steps[index]
+                    accepted = False
+                    def pick(box):
+                        nonlocal accepted
+                        selected[key] = box
+                        accepted = True
+                    def closed():
+                        if accepted:
+                            self.after(50, lambda: next_step(index+1))
+                        elif not committed:
+                            self.finish_calibration()
+                            self.status.set('위치 지정 취소. 기존 설정을 유지합니다.')
+                    Picker(self, sample, f'{index+1}/{len(steps)} · '+label, pick, on_close=closed)
+                next_step(0)
+            except Exception as error:
+                self.deiconify()
+                self.status.set(str(error))
+                self.finish_calibration()
+        self.after(5000 if mode == 'calendar' else 1500, take)
 
     def collect(self):
         self.preview.set(self.mode_choice.get() != 'Telegram 전송')

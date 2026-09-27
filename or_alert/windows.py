@@ -1,8 +1,4 @@
-"""Restricted Windows adapter: only department, doctor and query inputs.
-
-No file patching, memory access, patient-row actions, filter/date writes or
-background input. Every action validates the chosen foreground window.
-"""
+"""Windows adapter for calibrated query, filter and calendar controls."""
 import ctypes as C
 from ctypes import wintypes as W
 from dataclasses import dataclass
@@ -129,6 +125,16 @@ class Desktop:
         self.window, self.size, self.stopped = window, size, stopped
         self.expected_input = None
         self.critical_regions = None
+        self.allow_owned_popup = False
+
+    def belongs(self, hit):
+        if belongs_to_target(hit, self.window.handle):
+            return True
+        # Permit only a target-owned popup during a calibrated calendar operation.
+        root = u.GetAncestor(hit, 2)
+        return (self.allow_owned_popup and
+                u.GetAncestor(root, 3) == self.window.handle and
+                executable(root) == self.window.executable)
 
     def arm_user_input(self):
         self.expected_input = input_tick()
@@ -164,7 +170,7 @@ class Desktop:
             for x in xs:
                 for y in ys:
                     hit = u.WindowFromPoint(W.POINT(box[0]+x,box[1]+y))
-                    if not belongs_to_target(hit, hwnd):
+                    if not self.belongs(hit):
                         raise GuardError('조회 버튼 또는 수술 목록이 가려져 잠시 대기합니다.')
         return box
 
@@ -189,14 +195,14 @@ class Desktop:
         return image
 
     def click(self, kind, rectangle):
-        if kind not in ('department', 'doctor', 'query'):
+        if kind not in ('department', 'doctor', 'query', 'calendar'):
             raise GuardError('허용되지 않은 입력 대상입니다.')
         box = self.guard()
         x = box[0] + (rectangle[0] + rectangle[2]) // 2
         y = box[1] + (rectangle[1] + rectangle[3]) // 2
         if not (box[0] <= x < box[2] and box[1] <= y < box[3]):
             raise GuardError('입력 위치가 EMR 창 밖입니다.')
-        if not belongs_to_target(u.WindowFromPoint(W.POINT(x, y)), self.window.handle):
+        if not self.belongs(u.WindowFromPoint(W.POINT(x, y))):
             raise GuardError('입력 위치가 가려져 있습니다.')
         u.SetCursorPos(x, y)
         self.expected_input = input_tick()

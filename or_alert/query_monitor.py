@@ -1,4 +1,4 @@
-"""Query-only monitoring. No OCR and no department/doctor input."""
+"""Visual monitoring with serialized, calibrated Telegram filter commands."""
 import time
 import threading
 import math
@@ -9,6 +9,7 @@ from .layout import detect_grid, LayoutError
 from .visual import digest, row_boundaries, visual_snapshot
 from .windows import Desktop, GuardError, idle_seconds
 from .telegram import DeliveryError
+from .remote_controls import FilterControls, parse_date, validate_rect
 
 
 def shutdown_hours(value):
@@ -49,6 +50,8 @@ class Monitor:
         self.state = 'recovering'
         self.notices = queue.Queue()
         self.capture_requested = False
+        self.pending_filter = None
+        self.filter_active = False
         self.initial_sent = False
         self.next_query = 0
         self.next_recovery = 0
@@ -85,6 +88,7 @@ class Monitor:
     def begin_calibration(self):
         with self.desktop_lock:
             self.calibrating = True
+            self.pending_filter = None
             self.pause('조회 버튼 위치 지정 중')
 
     def end_calibration(self, window=None, rectangle=None, size=None):
@@ -189,10 +193,18 @@ class Monitor:
 
     def update_regions(self, image):
         if self.region:
-            self.desktop.critical_regions = [self.config['query_rect'],self.visible_region(image)]
+            self.desktop.critical_regions = [self.config['query_rect'],self.visible_region(image),self.notification_region(image)]
+
+    def notification_region(self, image):
+        custom = self.config.get('capture_rect')
+        if custom:
+            return validate_rect(custom, image.size)
+        visible = self.visible_region(image) if self.region else (0, 0, image.width, image.height)
+        # Include the date/department filters and a margin below the visible rows.
+        return (0, 0, image.width, min(image.height, visible[3]+48))
 
     def notification_image(self, image):
-        return image.crop(self.visible_region(image)) if self.region else image
+        return image.crop(self.notification_region(image))
 
     def notify_stopped(self):
         reason = self.stop_reason or '사용자가 감시를 중지했습니다.'
@@ -289,7 +301,79 @@ class Monitor:
         if not text: return None
         pieces = text[0].lower().split('@')
         if len(pieces)>2 or (len(pieces)==2 and pieces[1] != self.bot_username.lower()): return None
-        return pieces[0] if pieces[0] in ('/capture','/stop','/restart') else None
+        return pieces[0] if pieces[0] in ('/capture','/stop','/restart','/date','/dept','/help') else None
+
+    def reply(self, text):
+        # A requested command response is delivered even when routine notices are off.
+        self.emit('status', text)
+        if self.telegram:
+            self.telegram.send_notice('Alert Bot | '+text, silent=True)
+
+    def queue_filter(self, command, argument):
+        if self.filter_active:
+            self.reply('이전 조건 변경을 처리 중입니다. 결과 캡처 후 다시 요청하세요.')
+            return
+        if self.calibrating or self.state != 'running' or self.filter_active:
+            self.reply('위치 지정 또는 감시 대기 중입니다. 설정 완료 후 /restart로 재개하세요.')
+            return
+        if self.pending_filter is not None:
+            self.reply('이전 조건 변경을 처리 중입니다. 결과 캡처 후 다시 요청하세요.')
+            return
+        value = parse_date(argument) if command == '/date' else ''.join(argument.split())
+        if command == '/dept' and (not value or len(value) > 40):
+            raise ValueError('/dept 산부인과처럼 정확한 진료과 이름을 입력하세요.')
+        self.pending_filter = (command, value)
+        self.reply('조건 변경 요청 접수: '+str(value))
+
+    def apply_filter(self):
+        try:
+            self._apply_filter()
+        finally:
+            self.filter_active = False
+
+    def filter_checkpoint(self):
+        self.poll_commands()
+        self.check_lifecycle()
+        if self.state != 'running' or self.stop.is_set():
+            raise ValueError('조건 변경이 중지되었습니다. PC에서 현재 선택을 확인하세요.')
+
+    def _apply_filter(self):
+        with self.desktop_lock:
+            if self.pending_filter is None or self.state != 'running' or self.calibrating:
+                return
+            command, value = self.pending_filter
+            self.pending_filter = None
+            self.filter_active = True
+            old_regions = self.desktop.critical_regions
+            try:
+                self.desktop.guard()
+                controls = FilterControls(self.desktop, self.config, self.stop)
+                controls.checkpoint = self.filter_checkpoint
+                selected = controls.set_date(value) if command == '/date' else controls.set_department(value)
+                self.desktop.critical_regions = old_regions
+                self.desktop.guard()
+                self.desktop.click('query', self.config['query_rect'])
+                # A different query is a new baseline, never a list-change event.
+                self.baseline = self.baseline_rows = None
+                self.next_query = time.monotonic()+self.config['interval']
+            except Exception as error:
+                self.pause('조건 변경을 확인하지 못했습니다. PC 화면을 확인 후 /restart하세요.')
+                if isinstance(error, (ValueError, GuardError)):
+                    self.reply(str(error))
+                raise
+            finally:
+                self.desktop.critical_regions = old_regions
+                self.desktop.allow_owned_popup = False
+        if self.wait_interval(3): return
+        first = self.capture()
+        if self.wait_interval(2): return
+        second = self.capture()
+        if self.sample(first)[0] != self.sample(second)[0]:
+            self.pause('조건 변경 후 화면이 안정되지 않았습니다. 확인 후 /restart하세요.')
+            self.reply('조회 결과가 갱신 중이라 완료 처리하지 않았습니다.')
+            return
+        self.process(first, second)
+        self.send_current(second, '조회 조건 변경 완료: '+selected)
 
     def accepts_command(self, update):
         return self.command(update) is not None
@@ -305,12 +389,22 @@ class Monitor:
                 self.command_offset = update['update_id']+1
                 command = self.command(update)
                 if command == '/stop':
+                    self.pending_filter = None
                     self.capture_requested = False
                     self.pause('Telegram /stop 명령')
                 elif command == '/restart': self.restart()
                 elif command == '/capture':
                     if self.state == 'running': self.capture_requested = True
                     else: self.notices.put('현재 감시 대기 중입니다. /restart 후 /capture를 요청하세요.')
+                elif command in ('/date', '/dept'):
+                    parts = update['message'].get('text','').split(maxsplit=1)
+                    argument = parts[1].strip() if len(parts) == 2 else ''
+                    try:
+                        self.queue_filter(command, argument)
+                    except ValueError as error:
+                        self.reply(str(error))
+                elif command == '/help':
+                    self.reply('/date 2026-09-29 또는 오늘·내일·어제\n/dept 산부인과 (정확한 과 이름)\n/capture 현재 화면 · /stop 대기 · /restart 재개\n날짜·진료과 명령은 PC에서 위치 지정 후 감시 중에 사용합니다.')
         except DeliveryError as error:
             self.next_poll = time.monotonic()+max(30,error.retry_after)
             self.emit('status',f'명령 수신 오류 [{error.code}]: {error} 30초 이후 다시 확인합니다.')
@@ -320,7 +414,7 @@ class Monitor:
         while not self.stop.is_set():
             self.poll_commands()
             self.check_lifecycle()
-            if self.state != 'running': return True
+            if self.state != 'running' or self.pending_filter is not None: return True
             remaining = deadline-time.monotonic()
             if remaining <= 0: return False
             if self.stop.wait(min(2,remaining)): return True
@@ -338,6 +432,9 @@ class Monitor:
                     if self.state == 'recovering': self.recover()
                     if self.state != 'running':
                         self.stop.wait(.5)
+                        continue
+                    if self.pending_filter is not None:
+                        self.apply_filter()
                         continue
                     if self.capture_requested:
                         self.capture_requested = False
