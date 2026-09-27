@@ -1,0 +1,44 @@
+name: Build Windows 0.8
+on:
+  push:
+    branches: [version/0.8-remote-controls]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install Korean OCR and fonts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-WindowsCapability -Online -Name Language.Basic~~~ko-KR~0.0.1.0
+          Add-WindowsCapability -Online -Name Language.OCR~~~ko-KR~0.0.1.0
+          Add-WindowsCapability -Online -Name Language.Fonts.Kore~~~und-KORE~0.0.1.0
+      - name: Test and build
+        shell: pwsh
+        run: ./build.ps1
+      - name: Verify packaged EXE
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath 'dist/Alert Bot/Alert Bot.exe' -ArgumentList '--selfcheck', 'selfcheck.json' -PassThru
+          if (-not $process.WaitForExit(90000)) { $process.Kill(); throw 'Selfcheck timed out' }
+          $report = Get-Content selfcheck.json -Raw | ConvertFrom-Json
+          if (-not ($report.tk -and $report.dpapi -and $report.korean_ocr)) { throw "Selfcheck failed: $(Get-Content selfcheck.json -Raw)" }
+          Get-FileHash 'dist/AlertBot-windows-x64.zip' -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AlertBot-0.8.0-windows-x64
+          path: |
+            dist/AlertBot-windows-x64.zip
+            dist/SHA256.txt
+            selfcheck.json
+          if-no-files-found: error
+          retention-days: 30
