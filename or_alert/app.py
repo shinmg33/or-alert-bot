@@ -10,6 +10,7 @@ from .telegram import Telegram, DeliveryError
 from .windows import list_windows, Desktop, dpi_awareness, stop_pressed, GuardError
 from .query_monitor import Monitor, shutdown_hours
 from .outline import Outline
+from .commands import FIELDS, HELP
 
 
 class Picker(tk.Toplevel):
@@ -113,13 +114,25 @@ class App(tk.Tk):
         title = ttk.Frame(self, padding=18)
         title.pack(fill='x')
         ttk.Label(title, text='Alert Bot', font=('맑은 고딕', 22, 'bold')).pack(anchor='w')
-        ttk.Label(title, text='EMR에서 진료과·진료의를 직접 선택하세요. 봇은 조회 버튼만 누릅니다.').pack(anchor='w', pady=(4, 0))
+        ttk.Label(title, text='기본은 현재 조건으로 조회 반복 · 선택한 입력칸은 Telegram 명령으로 변경 가능').pack(anchor='w', pady=(4, 0))
         book = ttk.Notebook(self)
         book.pack(fill='both', expand=True, padx=18)
         settings = ttk.Frame(book, padding=18)
         connection = ttk.Frame(book, padding=18)
         book.add(settings, text='감시')
         book.add(connection, text='텔레그램 연결')
+        conditions = ttk.Frame(book, padding=18)
+        book.add(conditions, text='조건 입력칸 (선택)')
+        ttk.Label(conditions, text='각 입력칸을 캡처에서 지정하세요. 값은 명령을 보낼 때만 입력합니다.').pack(anchor='w')
+        self.field_labels = {}
+        for field, label in FIELDS.items():
+            row = ttk.Frame(conditions)
+            row.pack(fill='x', pady=8)
+            self.field_labels[field] = tk.StringVar(value='지정됨' if self.config.get('condition_fields', {}).get(field) else '미지정')
+            ttk.Button(row, text=label+' 위치 지정', command=lambda f=field: self.capture_setup(f)).pack(side='left')
+            ttk.Label(row, textvariable=self.field_labels[field], width=10).pack(side='left', padx=10)
+            ttk.Button(row, text='해제', command=lambda f=field: self.clear_field(f)).pack(side='left')
+        ttk.Label(conditions, text=HELP, justify='left', wraplength=720).pack(anchor='w', pady=12)
 
         row = ttk.Frame(settings)
         row.pack(fill='x')
@@ -143,7 +156,7 @@ class App(tk.Tk):
             option.pack(fill='x', pady=3)
             ttk.Label(option, text=label, width=24).pack(side='left')
             ttk.Combobox(option, textvariable=variable, values=values, state='readonly', width=25).pack(side='left')
-        ttk.Label(settings, text='진료과·진료의·수술일은 사람이 설정합니다. 봇은 조회만 누릅니다.\n변경된 화면을 전송하며, 표 구분이 가능하면 주요/세부 알림으로 표시합니다.', justify='left').pack(anchor='w', pady=8)
+        ttk.Label(settings, text='조건 변경이 필요하면 별도 탭에서 입력칸을 지정하세요. 미지정 시 기존 조회만 반복합니다.\n변경된 화면을 전송하며, 표 구분이 가능하면 주요/세부 알림으로 표시합니다.', justify='left').pack(anchor='w', pady=8)
         ttk.Button(settings, text='조회 버튼 위치 지정', command=self.capture_setup).pack(anchor='w', pady=8)
 
         ttk.Label(connection, text='BotFather에서 받은 API 토큰').pack(anchor='w')
@@ -158,7 +171,7 @@ class App(tk.Tk):
             button.pack(side='left', padx=(0, 6))
             self.network_buttons.append(button)
         ttk.Label(connection, text='① 토큰 입력 → 연결 진단\n② 비공개 그룹에 봇 추가\n③ 그룹에서 /start@봇사용자이름 전송 → 그룹 찾기\n④ 그룹 선택 → 테스트 메시지 보내기', justify='left').pack(anchor='w', pady=8)
-        ttk.Label(connection, text='그룹 명령: /capture 현재 화면 · /stop 감시 대기 · /restart 재시작\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
+        ttk.Label(connection, text='그룹 명령: /help 전체 명령어 안내 · /capture 현재 화면 · /stop 감시 대기 · /restart 재시작\n연결 진단은 메시지를 보내지 않습니다. 오류 원인과 해결 방법을 표시합니다.\n토큰은 이 Windows 계정으로 암호화 저장하며 GitHub에는 올리지 않습니다.', justify='left', wraplength=750).pack(anchor='w', pady=12)
 
         bottom = ttk.Frame(self, padding=18)
         bottom.pack(fill='x')
@@ -189,19 +202,33 @@ class App(tk.Tk):
             raise ValueError('EMR 수술 목록을 열고 창 찾기를 누르세요.')
         return self.windows[idx]
 
-    def capture_setup(self):
+    def clear_field(self, field):
+        if self.capture_busy: return
+        if self.active():
+            with self.monitor.desktop_lock:
+                self.monitor.pause('조건 입력칸 해제')
+                self.monitor.config.get('condition_fields', {}).pop(field, None)
+        self.config.get('condition_fields', {}).pop(field, None)
+        self.field_labels[field].set('미지정')
+        try: save_settings(self.config)
+        except Exception: self.status.set('입력칸은 해제됐지만 저장에 실패했습니다.')
+
+    def capture_setup(self, field='query'):
         if self.capture_busy:
             return
         try:
             window = self.chosen_window()
+            if field != 'query' and self.active() and window != self.monitor.desktop.window:
+                raise ValueError('감시 대상 창의 조회 버튼 위치부터 다시 지정하세요.')
         except ValueError as error:
             messagebox.showerror('화면 확인', str(error))
             return
+        label = '조회 버튼' if field == 'query' else FIELDS[field]
         self.capture_busy = True
         if self.active():
             self.monitor.begin_calibration()
         self.hide_outline()
-        self.status.set('EMR 화면을 캡처합니다. 조회 버튼만 드래그해주세요.')
+        self.status.set(f'EMR 화면을 캡처합니다. {label}만 드래그해주세요.')
         self.withdraw()
         def take():
             try:
@@ -210,16 +237,30 @@ class App(tk.Tk):
                 self.sample = desktop.capture_preview()
                 self.deiconify()
                 def selected(box):
-                    self.config['query_rect'] = box
-                    self.config['query_size'] = list(self.sample.size)
-                    if self.active():
-                        self.monitor.end_calibration(window, box, self.sample.size)
+                    if field == 'query':
+                        if tuple(self.config.get('query_size', ())) != tuple(self.sample.size):
+                            self.config.pop('condition_fields', None)
+                            for variable in self.field_labels.values(): variable.set('미지정')
+                        self.config['query_rect'] = box
+                        self.config['query_size'] = list(self.sample.size)
+                        if self.active():
+                            self.monitor.end_calibration(window, box, self.sample.size)
+                    else:
+                        if tuple(self.config.get('query_size', ())) != tuple(self.sample.size):
+                            self.status.set('현재 창의 조회 버튼 위치부터 지정하세요.')
+                            return
+                        spec = {'rect': box, 'size': list(self.sample.size)}
+                        self.config.setdefault('condition_fields', {})[field] = spec
+                        if self.active():
+                            with self.monitor.desktop_lock:
+                                self.monitor.config.setdefault('condition_fields', {})[field] = spec
+                        self.field_labels[field].set('지정됨')
                     try:
                         save_settings(self.config)
-                        self.status.set('조회 버튼 지정·저장 완료. 감시 재시작을 누르세요.')
+                        self.status.set(f'{label} 지정·저장 완료. 감시 재시작을 누르세요.')
                     except Exception:
-                        self.status.set('조회 버튼은 적용됐지만 설정 저장에 실패했습니다.')
-                Picker(self, self.sample, '조회 버튼만 드래그하세요', selected, on_close=self.finish_calibration)
+                        self.status.set(f'{label}은 적용됐지만 설정 저장에 실패했습니다.')
+                Picker(self, self.sample, f'{label}만 드래그하세요', selected, on_close=self.finish_calibration)
             except Exception as error:
                 self.deiconify()
                 self.status.set(str(error) if isinstance(error, GuardError) else 'EMR 화면 캡처 실패.')
@@ -420,3 +461,4 @@ class App(tk.Tk):
 def main():
     dpi_awareness()
     App().mainloop()
+

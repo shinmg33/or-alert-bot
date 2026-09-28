@@ -1,4 +1,4 @@
-"""Query-only monitoring. No OCR and no department/doctor input."""
+"""Query monitoring with explicitly calibrated optional condition inputs."""
 import time
 import threading
 import math
@@ -9,6 +9,7 @@ from .layout import detect_grid, LayoutError
 from .visual import digest, row_boundaries, visual_snapshot
 from .windows import Desktop, GuardError, idle_seconds
 from .telegram import DeliveryError
+from .commands import FIELDS, HELP, validate_value
 
 
 def shutdown_hours(value):
@@ -28,6 +29,9 @@ class Monitor:
             raise ValueError('조회 버튼 위치를 한 번 지정해주세요.')
         self.config, self.stop, self.emit, self.telegram = config, stop, emit, telegram
         self.desktop = Desktop(window, size=config['query_size'], stopped=stop.is_set)
+        self.pending_conditions = {}
+        self.condition_capture = False
+        self.replies = queue.Queue()
         self.region = None
         self.columns = None
         self.baseline = None
@@ -69,6 +73,8 @@ class Monitor:
     def pause(self, reason, automatic=False):
         with self.desktop_lock:
             if self.stop.is_set(): return
+            if not automatic:
+                self.pending_conditions.clear()
             target = 'recovering' if automatic else 'paused'
             if self.state == 'paused' and automatic: return
             if self.state == target: return
@@ -90,6 +96,8 @@ class Monitor:
     def end_calibration(self, window=None, rectangle=None, size=None):
         with self.desktop_lock:
             if rectangle is not None:
+                if tuple(size) != tuple(self.config['query_size']) or window != self.desktop.window:
+                    self.config.pop('condition_fields', None)
                 self.config['query_rect'] = list(rectangle)
                 self.config['query_size'] = list(size)
                 self.desktop.window = window
@@ -127,6 +135,12 @@ class Monitor:
                     self.pause(str(error), automatic=error.recoverable)
 
     def flush_notices(self):
+        while not self.replies.empty():
+            text = self.replies.get()
+            self.emit('status', text)
+            if self.telegram:
+                try: self.telegram.send_notice(text, silent=True)
+                except DeliveryError as error: self.emit('status', f'명령 응답 실패 [{error.code}]: {error}')
         if self.state == 'recovering' and self.automatic_pause_since is not None and not self.pause_reported and time.monotonic()-self.automatic_pause_since >= 120:
             self.notices.put('핵심 영역 또는 사용자 입력 때문에 2분 이상 감시를 기다리고 있습니다.')
             self.pause_reported = True
@@ -289,7 +303,7 @@ class Monitor:
         if not text: return None
         pieces = text[0].lower().split('@')
         if len(pieces)>2 or (len(pieces)==2 and pieces[1] != self.bot_username.lower()): return None
-        return pieces[0] if pieces[0] in ('/capture','/stop','/restart') else None
+        return pieces[0] if pieces[0] in ('/capture','/stop','/restart','/help','/date','/department','/doctor') else None
 
     def accepts_command(self, update):
         return self.command(update) is not None
@@ -304,7 +318,11 @@ class Monitor:
                 if self.command_offset is not None and update['update_id'] < self.command_offset: continue
                 self.command_offset = update['update_id']+1
                 command = self.command(update)
-                if command == '/stop':
+                if command == '/help': self.replies.put(HELP)
+                elif command in ('/date','/department','/doctor'):
+                    parts = update['message']['text'].strip().split(maxsplit=1)
+                    self.request_condition(command[1:], parts[1] if len(parts) == 2 else '')
+                elif command == '/stop':
                     self.capture_requested = False
                     self.pause('Telegram /stop 명령')
                 elif command == '/restart': self.restart()
@@ -315,12 +333,56 @@ class Monitor:
             self.next_poll = time.monotonic()+max(30,error.retry_after)
             self.emit('status',f'명령 수신 오류 [{error.code}]: {error} 30초 이후 다시 확인합니다.')
 
+    def request_condition(self, field, value):
+        try:
+            value = validate_value(field, value)
+            with self.desktop_lock:
+                if self.calibrating:
+                    raise ValueError('위치 지정 완료 후 다시 명령을 보내세요.')
+                spec = self.config.get('condition_fields', {}).get(field)
+                if not spec:
+                    raise ValueError(f'PC에서 {FIELDS[field]} 입력칸 위치를 먼저 지정하세요.')
+                if tuple(spec['size']) != tuple(self.config['query_size']):
+                    raise ValueError('창 크기가 달라졌습니다. 입력칸 위치를 다시 지정하세요.')
+                self.pending_conditions[field] = value
+                self.capture_requested = False
+                self.restart()
+            self.replies.put(f'{FIELDS[field]} 변경 요청 접수: {value}. 입력 후 조회를 재개합니다.')
+        except ValueError as error:
+            self.replies.put(str(error))
+
+    def apply_conditions(self):
+        with self.desktop_lock:
+            if self.state != 'running' or self.calibrating or self.stop.is_set(): return
+            if not self.pending_conditions: return
+            pending = self.pending_conditions.copy()
+            self.pending_conditions.clear()
+            original = self.desktop.critical_regions
+            try:
+                for field in FIELDS:
+                    if field not in pending: continue
+                    spec = self.config.get('condition_fields', {}).get(field)
+                    if not spec or tuple(spec['size']) != tuple(self.config['query_size']):
+                        raise ValueError('입력칸 위치를 다시 지정하세요.')
+                    self.desktop.critical_regions = list(original or []) + [spec['rect']]
+                    self.desktop.replace_text(field, spec['rect'], pending[field])
+            except Exception:
+                self.baseline = self.baseline_rows = None
+                self.pause('조건 입력이 중단됐습니다. EMR 값을 직접 확인한 뒤 다시 명령을 보내세요.')
+                self.replies.put('조건 입력 중단: 일부 값이 입력됐을 수 있습니다. EMR 확인이 필요합니다.')
+                raise
+            finally:
+                self.desktop.critical_regions = original
+            self.baseline = self.baseline_rows = None
+            self.condition_capture = True
+            self.next_query = 0
+
     def wait_interval(self, seconds):
         deadline = time.monotonic()+seconds
         while not self.stop.is_set():
             self.poll_commands()
             self.check_lifecycle()
-            if self.state != 'running': return True
+            if self.state != 'running' or self.pending_conditions: return True
             remaining = deadline-time.monotonic()
             if remaining <= 0: return False
             if self.stop.wait(min(2,remaining)): return True
@@ -339,6 +401,8 @@ class Monitor:
                     if self.state != 'running':
                         self.stop.wait(.5)
                         continue
+                    if self.pending_conditions:
+                        self.apply_conditions()
                     if self.capture_requested:
                         self.capture_requested = False
                         self.send_current(self.capture(),'수동 캡처 /capture')
@@ -353,6 +417,9 @@ class Monitor:
                     first = self.capture()
                     if self.wait_interval(2): continue
                     second = self.capture()
+                    if self.condition_capture and self.sample(first)[0] == self.sample(second)[0]:
+                        self.send_current(second, '조회 조건 변경 후 화면 · 실제 선택값 확인 필요')
+                        self.condition_capture = False
                     self.process(first,second)
                 except GuardError as error:
                     self.pause(str(error),automatic=error.recoverable)
@@ -367,3 +434,4 @@ class Monitor:
             self.emit('outline_hide',None)
             self.notify_stopped()
             self.emit('stopped',self.timed_out)
+

@@ -1,6 +1,6 @@
 """Restricted Windows adapter: only department, doctor and query inputs.
 
-No file patching, memory access, patient-row actions, filter/date writes or
+No file patching, memory access, patient-row actions or
 background input. Every action validates the chosen foreground window.
 """
 import ctypes as C
@@ -189,7 +189,7 @@ class Desktop:
         return image
 
     def click(self, kind, rectangle):
-        if kind not in ('department', 'doctor', 'query'):
+        if kind not in ('date', 'department', 'doctor', 'query'):
             raise GuardError('허용되지 않은 입력 대상입니다.')
         box = self.guard()
         x = box[0] + (rectangle[0] + rectangle[2]) // 2
@@ -204,6 +204,47 @@ class Desktop:
         u.mouse_event(0x0002, 0, 0, 0, 0)
         u.mouse_event(0x0004, 0, 0, 0, 0)
         self.expected_input = input_tick()
+
+    def replace_text(self, kind, rectangle, text):
+        from .commands import validate_value
+        text = validate_value(kind, text)
+        # Require foreground for keyboard input even when the query-only guard
+        # permits a visible background window.
+        def check():
+            self.guard()
+            if u.GetForegroundWindow() != self.window.handle:
+                raise GuardError('조건 입력 중 대상 창이 바뀌었습니다.', False)
+        check()
+        box = self.guard()
+        left, top, right, bottom = rectangle
+        if not (0 <= left < right <= box[2]-box[0] and 0 <= top < bottom <= box[3]-box[1]):
+            raise GuardError('입력칸 위치를 다시 지정하세요.', False)
+        self.click(kind, rectangle)
+        time.sleep(.05)
+        check()
+        self.click(kind, rectangle)
+        time.sleep(.15)
+        check()
+        # Replace the entire value, including masked date fields.
+        u.keybd_event(0x11, 0, 0, 0)
+        try:
+            u.keybd_event(0x41, 0, 0, 0)
+            u.keybd_event(0x41, 0, 2, 0)
+        finally:
+            u.keybd_event(0x11, 0, 2, 0)
+        self.expected_input = input_tick()
+        time.sleep(.05)
+        for offset in range(0, len(text.encode('utf-16-le')), 2):
+            check()
+            code = int.from_bytes(text.encode('utf-16-le')[offset:offset+2], 'little')
+            send_unicode(code)
+            self.expected_input = input_tick()
+        check()
+        u.keybd_event(0x0D, 0, 0, 0)
+        u.keybd_event(0x0D, 0, 2, 0)
+        self.expected_input = input_tick()
+        time.sleep(.2)
+        check()
 
     def select(self, kind, rectangle, index):
         if kind not in ('department', 'doctor') or not 0 <= index <= 200:
@@ -226,3 +267,34 @@ class Desktop:
             u.keybd_event(vk, 0, 2, 0)
             self.expected_input = input_tick()
             time.sleep(0.025)
+
+
+
+# INPUT must include the largest union member to have the correct x64 size.
+class KeyboardInput(C.Structure):
+    _fields_ = [('vk', W.WORD), ('scan', W.WORD), ('flags', W.DWORD),
+                ('time', W.DWORD), ('extra', C.c_size_t)]
+
+
+class MouseInput(C.Structure):
+    _fields_ = [('dx', W.LONG), ('dy', W.LONG), ('data', W.DWORD),
+                ('flags', W.DWORD), ('time', W.DWORD), ('extra', C.c_size_t)]
+
+
+class InputUnion(C.Union):
+    _fields_ = [('ki', KeyboardInput), ('mi', MouseInput)]
+
+
+class Input(C.Structure):
+    _fields_ = [('type', W.DWORD), ('value', InputUnion)]
+
+
+def send_unicode(code):
+    events = (Input * 2)()
+    for event, flags in zip(events, (0x0004, 0x0004 | 0x0002)):
+        event.type = 1
+        event.value.ki = KeyboardInput(0, code, flags, 0, 0)
+    u.SendInput.argtypes = [W.UINT, C.POINTER(Input), C.c_int]
+    u.SendInput.restype = W.UINT
+    if u.SendInput(2, events, C.sizeof(Input)) != 2:
+        raise GuardError('문자 입력 실패. EMR과 봇의 실행 권한을 확인하세요.', False)
