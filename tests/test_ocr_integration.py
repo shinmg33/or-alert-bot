@@ -8,6 +8,10 @@ from or_alert.ocr import Reader
 class OfflineOcrTest(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows OCR only')
     def test_korean_ocr_on_worker_thread(self):
+        from winrt.windows.media.ocr import OcrEngine
+        from winrt.windows.globalization import Language
+        if not OcrEngine.is_language_supported(Language('ko')):
+            self.skipTest('Optional Korean OCR language pack is not installed')
         def run():
             image = Image.new('RGB', (500, 80), 'white')
             font = ImageFont.truetype('C:/Windows/Fonts/malgun.ttf', 24)
@@ -19,3 +23,4 @@ class OfflineOcrTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
